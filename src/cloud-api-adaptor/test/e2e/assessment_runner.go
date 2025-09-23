@@ -70,6 +70,12 @@ type TestCase struct {
 	deletionWithin              time.Duration
 	expectedInstanceType        string
 	isNydusSnapshotter          bool
+	skipResourceCheck           bool
+}
+
+func (tc *TestCase) SkipResourceCheck(skip bool) *TestCase {
+	tc.skipResourceCheck = true
+	return tc
 }
 
 func (tc *TestCase) WithConfigMap(configMap *v1.ConfigMap) *TestCase {
@@ -359,10 +365,11 @@ func (tc *TestCase) Run() {
 							t.Errorf("AssessPodTestCommands failed with error: %v", err)
 						}
 					}
-
-					err := AssessPodRequestAndLimit(ctx, client, tc.pod)
-					if err != nil {
-						t.Errorf("request and limit for podvm extended resource are not set to 1: %v", err)
+					if !tc.skipResourceCheck {
+						err := AssessPodRequestAndLimit(ctx, client, tc.pod)
+						if err != nil {
+							t.Errorf("request and limit for podvm extended resource are not set to 1: %v", err)
+						}
 					}
 
 					tc.assert.HasPodVM(t, tc.pod.Name)
