@@ -328,6 +328,11 @@ func VerifyCaaPodLogContains(ctx context.Context, t *testing.T, client klient.Cl
 
 func getPodvmName(ctx context.Context, client klient.Client, pod *v1.Pod) (string, error) {
 
+	if os.Getenv("SKIP_PODVM_VALIDATION") == "true" {
+		fmt.Print("\nSkipping getPodvmName as SKIP_PODVM_VALIDATION is set to true\n")
+		return "", nil
+	}
+
 	for range 10 {
 		podLogString, err := getCaaPodLogForPod(ctx, nil, client, pod)
 		if err != nil {
@@ -528,6 +533,11 @@ func IsBufferEmpty(buffer bytes.Buffer) bool {
 
 func AssessPodRequestAndLimit(ctx context.Context, client klient.Client, pod *v1.Pod) error {
 	// Check if the pod has the "kata.peerpods.io/vm request and limit with value "1"
+
+	if os.Getenv("SKIP_PODVM_VALIDATION") == "true" {
+		fmt.Print("Skipping podvm request and limit validation as SKIP_PODVM_VALIDATION is set to true")
+		return nil
+	}
 
 	podVmExtResource := "kata.peerpods.io/vm"
 
