@@ -126,7 +126,9 @@ func getCaaPod(ctx context.Context, client klient.Client, t *testing.T, nodeName
 			Namespace: pv.GetCAANamespace(),
 		},
 	}
-	pods, err := GetPodNamesByLabel(ctx, client, t, caaPod.GetObjectMeta().GetNamespace(), "app", "cloud-api-adaptor", nodeName)
+
+	labelName, labelValue := pv.GetCAAPodLabel()
+	pods, err := GetPodNamesByLabel(ctx, client, t, caaPod.GetObjectMeta().GetNamespace(), labelName, labelValue, nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("getCaaPod: GetPodNamesByLabel failed: %v", err)
 	}
