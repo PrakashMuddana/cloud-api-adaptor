@@ -351,3 +351,15 @@ func waitForNamespaceToBeUseable(ctx context.Context, client klient.Client, name
 	}
 	return fmt.Errorf("default service account not found in namespace '%s' after %.0f seconds wait", namespaceName, WaitNamespaceAvailableTimeout.Seconds())
 }
+
+func GetCAAPodLabel() (string, string) {
+	labelName := os.Getenv("TEST_CAA_POD_LABEL_NAME")
+	if labelName == "" {
+		labelName = "app"
+	}
+	labelValue := os.Getenv("TEST_CAA_POD_LABEL_VALUE")
+	if labelValue == "" {
+		labelValue = "cloud-api-adaptor"
+	}
+	return labelName, labelValue
+}
