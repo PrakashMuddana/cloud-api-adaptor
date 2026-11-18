@@ -1,11 +1,17 @@
+//go:build cgo
+
 // (C) Copyright Confidential Containers Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 package libvirt
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/netip"
 	"testing"
+	"time"
 
 	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
 	"github.com/stretchr/testify/assert"
@@ -234,6 +240,71 @@ func TestGetDeletableDiskPaths(t *testing.T) {
 			},
 			expected: []string{},
 		},
+		{
+			name: "skip CSI data disks by serial prefix",
+			domain: &libvirtxml.Domain{
+				Devices: &libvirtxml.DomainDeviceList{
+					Disks: []libvirtxml.DomainDisk{
+						{
+							Source: &libvirtxml.DomainDiskSource{
+								File: &libvirtxml.DomainDiskSourceFile{File: testBootDisk},
+							},
+							Driver: &libvirtxml.DomainDiskDriver{Type: "qcow2"},
+							Target: &libvirtxml.DomainDiskTarget{Dev: "sda", Bus: "sata"},
+						},
+						{
+							Source: &libvirtxml.DomainDiskSource{
+								File: &libvirtxml.DomainDiskSourceFile{File: "/data/csi-vol-pvc-123.raw"},
+							},
+							Driver: &libvirtxml.DomainDiskDriver{Name: "qemu", Type: "raw"},
+							Target: &libvirtxml.DomainDiskTarget{Dev: "vdb", Bus: "virtio"},
+							Serial: "caa-csi-0",
+						},
+						{
+							Source: &libvirtxml.DomainDiskSource{
+								File: &libvirtxml.DomainDiskSourceFile{File: "/data/csi-vol-pvc-456.raw"},
+							},
+							Driver: &libvirtxml.DomainDiskDriver{Name: "qemu", Type: "raw"},
+							Target: &libvirtxml.DomainDiskTarget{Dev: "vdc", Bus: "virtio"},
+							Serial: "caa-csi-1",
+						},
+					},
+				},
+			},
+			expected: []string{testBootDisk},
+		},
+		{
+			name: "s390x cidata stays deletable when CSI disks have serial and IOMMU",
+			domain: &libvirtxml.Domain{
+				Devices: &libvirtxml.DomainDeviceList{
+					Disks: []libvirtxml.DomainDisk{
+						{
+							Source: &libvirtxml.DomainDiskSource{
+								File: &libvirtxml.DomainDiskSourceFile{File: testBootDisk},
+							},
+							Driver: &libvirtxml.DomainDiskDriver{Name: "qemu", Type: "qcow2", IOMMU: "on"},
+							Target: &libvirtxml.DomainDiskTarget{Dev: "vda", Bus: "virtio"},
+						},
+						{
+							Source: &libvirtxml.DomainDiskSource{
+								File: &libvirtxml.DomainDiskSourceFile{File: "/var/lib/libvirt/images/cidata.iso"},
+							},
+							Driver: &libvirtxml.DomainDiskDriver{Name: "qemu", Type: "raw", IOMMU: "on"},
+							Target: &libvirtxml.DomainDiskTarget{Dev: "vdb", Bus: "virtio"},
+						},
+						{
+							Source: &libvirtxml.DomainDiskSource{
+								File: &libvirtxml.DomainDiskSourceFile{File: "/data/csi-vol-pvc-789.raw"},
+							},
+							Driver: &libvirtxml.DomainDiskDriver{Name: "qemu", Type: "raw", IOMMU: "on"},
+							Target: &libvirtxml.DomainDiskTarget{Dev: "vdc", Bus: "virtio"},
+							Serial: "caa-csi-0",
+						},
+					},
+				},
+			},
+			expected: []string{testBootDisk, "/var/lib/libvirt/images/cidata.iso"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -242,6 +313,119 @@ func TestGetDeletableDiskPaths(t *testing.T) {
 			assert.Equal(t, tt.expected, paths)
 		})
 	}
+}
+
+func TestDataDisksToVirtio(t *testing.T) {
+	t.Run("empty list returns nil", func(t *testing.T) {
+		disks := dataDisksToVirtio(nil, 'b', false)
+		assert.Nil(t, disks)
+	})
+
+	t.Run("generates correct disk elements starting at vdb", func(t *testing.T) {
+		paths := []string{"/data/vol-1.raw", "/data/vol-2.raw"}
+		disks := dataDisksToVirtio(paths, 'b', false)
+		require.Len(t, disks, 2)
+
+		assert.Equal(t, "vdb", disks[0].Target.Dev)
+		assert.Equal(t, "virtio", disks[0].Target.Bus)
+		assert.Equal(t, "raw", disks[0].Driver.Type)
+		assert.Equal(t, "caa-csi-0", disks[0].Serial)
+		assert.Empty(t, disks[0].Driver.IOMMU)
+		assert.Equal(t, "/data/vol-1.raw", disks[0].Source.File.File)
+
+		assert.Equal(t, "vdc", disks[1].Target.Dev)
+		assert.Equal(t, "caa-csi-1", disks[1].Serial)
+		assert.Equal(t, "/data/vol-2.raw", disks[1].Source.File.File)
+	})
+
+	t.Run("s390x starts at vdc with IOMMU on", func(t *testing.T) {
+		paths := []string{"/data/vol-1.raw", "/data/vol-2.raw"}
+		disks := dataDisksToVirtio(paths, 'c', true)
+		require.Len(t, disks, 2)
+
+		assert.Equal(t, "vdc", disks[0].Target.Dev)
+		assert.Equal(t, "vdd", disks[1].Target.Dev)
+		assert.Equal(t, "on", disks[0].Driver.IOMMU)
+		assert.Equal(t, "caa-csi-0", disks[0].Serial)
+		assert.Equal(t, "caa-csi-1", disks[1].Serial)
+	})
+
+	t.Run("device names increment correctly", func(t *testing.T) {
+		paths := make([]string, 3)
+		for i := range paths {
+			paths[i] = fmt.Sprintf("/data/vol-%d.raw", i)
+		}
+		disks := dataDisksToVirtio(paths, 'b', false)
+		assert.Equal(t, "vdb", disks[0].Target.Dev)
+		assert.Equal(t, "vdc", disks[1].Target.Dev)
+		assert.Equal(t, "vdd", disks[2].Target.Dev)
+	})
+}
+
+func TestCreateDomainXMLWithDataDisks(t *testing.T) {
+	dataPaths := []string{"/data/csi-vol-1.raw", "/data/csi-vol-2.raw"}
+
+	t.Run("s390x appends data disks from vdc with IOMMU", func(t *testing.T) {
+		mockCaps := createMockCaps(archS390x, "/usr/bin/qemu-system-s390x", libvirtxml.CapsGuestMachine{
+			Name:      "s390-ccw-virtio",
+			Canonical: "s390-ccw-virtio-rhel9.0.0",
+		})
+		client := &libvirtClient{caps: mockCaps, networkName: testNetworkName}
+		cfg := createTestDomainConfig("test-s390x-csi", 2, 2048, testNetworkName, testCiDataISO)
+		cfg.dataDisks = dataPaths
+
+		domain, err := createDomainXMLs390x(client, cfg, &vmConfig{})
+		require.NoError(t, err)
+		require.Len(t, domain.Devices.Disks, 4)
+
+		assert.Equal(t, "vda", domain.Devices.Disks[0].Target.Dev)
+		assert.Equal(t, "vdb", domain.Devices.Disks[1].Target.Dev)
+		assert.Equal(t, "vdc", domain.Devices.Disks[2].Target.Dev)
+		assert.Equal(t, "vdd", domain.Devices.Disks[3].Target.Dev)
+		assert.Equal(t, dataPaths[0], domain.Devices.Disks[2].Source.File.File)
+		assert.Equal(t, "caa-csi-0", domain.Devices.Disks[2].Serial)
+		assert.Equal(t, "caa-csi-1", domain.Devices.Disks[3].Serial)
+		assert.Equal(t, "on", domain.Devices.Disks[2].Driver.IOMMU)
+		assert.Empty(t, domain.Devices.Disks[1].Serial)
+	})
+
+	t.Run("x86_64 appends data disks from vdb without IOMMU", func(t *testing.T) {
+		mockCaps := createMockCaps(archX86_64, "/usr/bin/qemu-system-x86_64")
+		client := &libvirtClient{caps: mockCaps, networkName: testNetworkName}
+		cfg := createTestDomainConfig("test-x86-csi", 2, 2048, testNetworkName, testCiDataISO)
+		cfg.dataDisks = dataPaths
+
+		domain, err := createDomainXMLx86_64(client, cfg, &vmConfig{launchSecurityType: NoLaunchSecurity})
+		require.NoError(t, err)
+		require.Len(t, domain.Devices.Disks, 4)
+
+		assert.Equal(t, "vdb", domain.Devices.Disks[2].Target.Dev)
+		assert.Equal(t, "vdc", domain.Devices.Disks[3].Target.Dev)
+		assert.Equal(t, "caa-csi-0", domain.Devices.Disks[2].Serial)
+		assert.Equal(t, "caa-csi-1", domain.Devices.Disks[3].Serial)
+		assert.Empty(t, domain.Devices.Disks[2].Driver.IOMMU)
+	})
+
+	t.Run("aarch64 appends data disks from vdb with IOMMU", func(t *testing.T) {
+		mockCaps := createMockCaps(archAArch64, "/usr/bin/qemu-system-aarch64", libvirtxml.CapsGuestMachine{
+			Name:      "virt",
+			Canonical: "virt-4.2",
+		})
+		client := &libvirtClient{caps: mockCaps, networkName: testNetworkName}
+		cfg := createTestDomainConfig("test-aarch64-csi", 2, 2048, testNetworkName, testCloudInitISO)
+		cfg.dataDisks = dataPaths
+
+		domain, err := createDomainXMLaarch64(client, cfg, &vmConfig{})
+		require.NoError(t, err)
+		require.Len(t, domain.Devices.Disks, 4)
+
+		assert.Equal(t, "vda", domain.Devices.Disks[0].Target.Dev)
+		assert.Equal(t, "vdb", domain.Devices.Disks[2].Target.Dev)
+		assert.Equal(t, "vdc", domain.Devices.Disks[3].Target.Dev)
+		assert.Equal(t, "caa-csi-0", domain.Devices.Disks[2].Serial)
+		assert.Equal(t, "caa-csi-1", domain.Devices.Disks[3].Serial)
+		assert.Equal(t, "on", domain.Devices.Disks[2].Driver.IOMMU)
+	})
 }
 
 func TestGetGuestForArchType(t *testing.T) {
@@ -255,33 +439,33 @@ func TestGetGuestForArchType(t *testing.T) {
 	}{
 		{
 			name:        "find x86_64 guest",
-			caps:        createMockCaps("x86_64", ""),
-			arch:        "x86_64",
-			ostype:      "hvm",
+			caps:        createMockCaps(archX86_64, ""),
+			arch:        archX86_64,
+			ostype:      typeHardwareVirtualMachine,
 			expectError: false,
-			expectArch:  "x86_64",
+			expectArch:  archX86_64,
 		},
 		{
 			name:        "find s390x guest",
-			caps:        createMockCaps("s390x", ""),
-			arch:        "s390x",
-			ostype:      "hvm",
+			caps:        createMockCaps(archS390x, ""),
+			arch:        archS390x,
+			ostype:      typeHardwareVirtualMachine,
 			expectError: false,
-			expectArch:  "s390x",
+			expectArch:  archS390x,
 		},
 		{
 			name:        "find aarch64 guest",
-			caps:        createMockCaps("aarch64", ""),
-			arch:        "aarch64",
-			ostype:      "hvm",
+			caps:        createMockCaps(archAArch64, ""),
+			arch:        archAArch64,
+			ostype:      typeHardwareVirtualMachine,
 			expectError: false,
-			expectArch:  "aarch64",
+			expectArch:  archAArch64,
 		},
 		{
 			name:        "architecture not found",
-			caps:        createMockCaps("x86_64", ""),
+			caps:        createMockCaps(archX86_64, ""),
 			arch:        "invalid-arch",
-			ostype:      "hvm",
+			ostype:      typeHardwareVirtualMachine,
 			expectError: true,
 		},
 		{
@@ -291,13 +475,13 @@ func TestGetGuestForArchType(t *testing.T) {
 					{
 						OSType: "xen",
 						Arch: libvirtxml.CapsGuestArch{
-							Name: "x86_64",
+							Name: archX86_64,
 						},
 					},
 				},
 			},
-			arch:        "x86_64",
-			ostype:      "hvm",
+			arch:        archX86_64,
+			ostype:      typeHardwareVirtualMachine,
 			expectError: true,
 		},
 		{
@@ -305,8 +489,8 @@ func TestGetGuestForArchType(t *testing.T) {
 			caps: &libvirtxml.Caps{
 				Guests: []libvirtxml.CapsGuest{},
 			},
-			arch:        "x86_64",
-			ostype:      "hvm",
+			arch:        archX86_64,
+			ostype:      typeHardwareVirtualMachine,
 			expectError: true,
 		},
 	}
@@ -398,10 +582,10 @@ func TestGetCanonicalMachineName(t *testing.T) {
 	}{
 		{
 			name: "find canonical machine in arch machines",
-			caps: createMockCaps("x86_64", "",
+			caps: createMockCaps(archX86_64, "",
 				libvirtxml.CapsGuestMachine{Name: "pc", Canonical: "pc-i440fx-2.12"}),
-			arch:           "x86_64",
-			virttype:       "hvm",
+			arch:           archX86_64,
+			virttype:       typeHardwareVirtualMachine,
 			targetMachine:  "pc",
 			expectedResult: "pc-i440fx-2.12",
 			expectError:    false,
@@ -411,9 +595,9 @@ func TestGetCanonicalMachineName(t *testing.T) {
 			caps: &libvirtxml.Caps{
 				Guests: []libvirtxml.CapsGuest{
 					{
-						OSType: "hvm",
+						OSType: typeHardwareVirtualMachine,
 						Arch: libvirtxml.CapsGuestArch{
-							Name: "x86_64",
+							Name: archX86_64,
 							Domains: []libvirtxml.CapsGuestDomain{
 								{
 									Machines: []libvirtxml.CapsGuestMachine{
@@ -425,26 +609,26 @@ func TestGetCanonicalMachineName(t *testing.T) {
 					},
 				},
 			},
-			arch:           "x86_64",
-			virttype:       "hvm",
+			arch:           archX86_64,
+			virttype:       typeHardwareVirtualMachine,
 			targetMachine:  "q35",
 			expectedResult: "pc-q35-2.12",
 			expectError:    false,
 		},
 		{
 			name: "machine not found returns error",
-			caps: createMockCaps("x86_64", "",
+			caps: createMockCaps(archX86_64, "",
 				libvirtxml.CapsGuestMachine{Name: "pc"}),
-			arch:          "x86_64",
-			virttype:      "hvm",
+			arch:          archX86_64,
+			virttype:      typeHardwareVirtualMachine,
 			targetMachine: "nonexistent",
 			expectError:   true,
 		},
 		{
 			name:          "architecture not found returns error",
-			caps:          createMockCaps("x86_64", ""),
+			caps:          createMockCaps(archX86_64, ""),
 			arch:          "invalid-arch",
-			virttype:      "hvm",
+			virttype:      typeHardwareVirtualMachine,
 			targetMachine: "pc",
 			expectError:   true,
 		},
@@ -547,7 +731,7 @@ func TestConfigVerifier(t *testing.T) {
 					c.PoolName = ""
 				}),
 			},
-			expectedError: "PoolName is empty",
+			expectedError: "pool name is empty",
 		},
 		{
 			name: "empty network name fails",
@@ -556,7 +740,7 @@ func TestConfigVerifier(t *testing.T) {
 					c.NetworkName = ""
 				}),
 			},
-			expectedError: "NetworkName is empty",
+			expectedError: "network name is empty",
 		},
 		{
 			name: "empty volume name fails",
@@ -565,7 +749,7 @@ func TestConfigVerifier(t *testing.T) {
 					c.VolName = ""
 				}),
 			},
-			expectedError: "VolName is empty",
+			expectedError: "volume name is empty",
 		},
 		{
 			name: "zero CPU fails",
@@ -583,7 +767,7 @@ func TestConfigVerifier(t *testing.T) {
 					c.Memory = 0
 				}),
 			},
-			expectedError: "Memory must be greater than zero",
+			expectedError: "memory must be greater than zero",
 		},
 		{
 			name: "invalid cpuset fails",
@@ -819,8 +1003,31 @@ func TestCPUSetXMLMarshaling(t *testing.T) {
 	}
 }
 
-func TestGetLaunchSecurityTypeInvalidURI(t *testing.T) {
-	_, err := GetLaunchSecurityType("invalid://uri")
+func TestGetLaunchSecurityType(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    string
+		expected LaunchSecurityType
+	}{
+		{name: "s390x returns S390PV", model: archS390x, expected: S390PV},
+		{name: "x86_64 returns NoLaunchSecurity", model: archX86_64, expected: NoLaunchSecurity},
+		{name: "unknown arch returns NoLaunchSecurity", model: "riscv64", expected: NoLaunchSecurity},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &libvirtClient{
+				nodeInfo: &libvirt.NodeInfo{Model: tc.model},
+			}
+			got, err := GetLaunchSecurityType(client)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestGetLaunchSecurityTypeNilNodeInfo(t *testing.T) {
+	client := &libvirtClient{}
+	_, err := GetLaunchSecurityType(client)
 	assert.Error(t, err)
 }
 
@@ -828,7 +1035,7 @@ func createMockCaps(arch, emulator string, machines ...libvirtxml.CapsGuestMachi
 	return &libvirtxml.Caps{
 		Guests: []libvirtxml.CapsGuest{
 			{
-				OSType: "hvm",
+				OSType: typeHardwareVirtualMachine,
 				Arch: libvirtxml.CapsGuestArch{
 					Name:     arch,
 					Emulator: emulator,
@@ -839,7 +1046,7 @@ func createMockCaps(arch, emulator string, machines ...libvirtxml.CapsGuestMachi
 	}
 }
 
-// TestCreateDomainXMLs390xWithMocks tests s390x domain XML generation using mocks
+// TestCreateDomainXMLArchitecturesWithMocks tests domain XML generation for s390x and aarch64 architectures using mocks
 func TestCreateDomainXMLArchitecturesWithMocks(t *testing.T) {
 	tests := []struct {
 		name                 string
@@ -854,10 +1061,11 @@ func TestCreateDomainXMLArchitecturesWithMocks(t *testing.T) {
 		createFunc           func(*libvirtClient, *domainConfig, *vmConfig) (*libvirtxml.Domain, error)
 		expectedFirmware     string
 		expectSCSIController bool
+		expectedCPUMode      string
 	}{
 		{
 			name:             "s390x architecture",
-			arch:             "s390x",
+			arch:             archS390x,
 			vmName:           "test-s390x-vm",
 			cpu:              2,
 			mem:              2048,
@@ -866,10 +1074,11 @@ func TestCreateDomainXMLArchitecturesWithMocks(t *testing.T) {
 			machineName:      "s390-ccw-virtio",
 			machineCanonical: "s390-ccw-virtio-rhel9.0.0",
 			createFunc:       createDomainXMLs390x,
+			expectedCPUMode:  cpuModeHostModel,
 		},
 		{
 			name:                 "aarch64 architecture",
-			arch:                 "aarch64",
+			arch:                 archAArch64,
 			vmName:               "test-aarch64-vm",
 			cpu:                  4,
 			mem:                  4096,
@@ -880,6 +1089,7 @@ func TestCreateDomainXMLArchitecturesWithMocks(t *testing.T) {
 			createFunc:           createDomainXMLaarch64,
 			expectedFirmware:     "efi",
 			expectSCSIController: true,
+			expectedCPUMode:      cpuModeHostPassthrough,
 		},
 	}
 
@@ -931,13 +1141,77 @@ func TestCreateDomainXMLArchitecturesWithMocks(t *testing.T) {
 				assert.Len(t, domain.Devices.Controllers, 1)
 				assert.Equal(t, "scsi", domain.Devices.Controllers[0].Type)
 			}
+
+			// Verify CPU mode is set as expected for the architecture
+			if tt.expectedCPUMode != "" {
+				require.NotNil(t, domain.CPU, "CPU configuration should be set")
+				assert.Equal(t, tt.expectedCPUMode, domain.CPU.Mode)
+			}
+		})
+	}
+}
+
+func TestCreateDomainXMLs390xLaunchSecurity(t *testing.T) {
+	mockCaps := createMockCaps(archS390x, "/usr/bin/qemu-system-s390x", libvirtxml.CapsGuestMachine{
+		Name:      "s390-ccw-virtio",
+		Canonical: "s390-ccw-virtio-rhel9.0.0",
+	})
+	mockClient := &libvirtClient{
+		caps:        mockCaps,
+		networkName: testNetworkName,
+	}
+	cfg := createTestDomainConfig("test-s390x-sec", 2, 2048, testNetworkName, testCiDataISO)
+
+	tests := []struct {
+		name           string
+		launchSecurity LaunchSecurityType
+		expectedError  string
+		expectS390PV   bool
+	}{
+		{
+			name:           "S390PV emits launchSecurity element",
+			launchSecurity: S390PV,
+			expectS390PV:   true,
+		},
+		{
+			name:           "NoLaunchSecurity omits launchSecurity element",
+			launchSecurity: NoLaunchSecurity,
+			expectS390PV:   false,
+		},
+		{
+			name:           "unknown security type returns error",
+			launchSecurity: LaunchSecurityType(99),
+			expectedError:  "launch security type unknown is not supported for s390x",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vm := &vmConfig{launchSecurityType: tt.launchSecurity}
+			domain, err := createDomainXMLs390x(mockClient, cfg, vm)
+
+			if tt.expectedError != "" {
+				assert.EqualError(t, err, tt.expectedError)
+				assert.Nil(t, domain)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, domain)
+
+			if tt.expectS390PV {
+				require.NotNil(t, domain.LaunchSecurity, "LaunchSecurity should be set for S390PV")
+				assert.NotNil(t, domain.LaunchSecurity.S390PV, "S390PV field should be non-nil")
+			} else {
+				assert.Nil(t, domain.LaunchSecurity, "LaunchSecurity should be nil for NoLaunchSecurity")
+			}
 		})
 	}
 }
 
 // TestCreateDomainXMLx86_64 tests x86_64 domain XML generation
 func TestCreateDomainXMLx86_64(t *testing.T) {
-	mockCaps := createMockCaps("x86_64", "/usr/bin/qemu-system-x86_64")
+	mockCaps := createMockCaps(archX86_64, "/usr/bin/qemu-system-x86_64")
 
 	mockClient := &libvirtClient{
 		caps:        mockCaps,
@@ -999,7 +1273,7 @@ func TestCreateDomainXMLx86_64(t *testing.T) {
 			assert.Equal(t, tt.cfg.name, domain.Name)
 			assert.Equal(t, tt.cfg.cpu, domain.VCPU.Value)
 			assert.Equal(t, tt.cfg.mem, domain.Memory.Value)
-			assert.Equal(t, "x86_64", domain.OS.Type.Arch)
+			assert.Equal(t, archX86_64, domain.OS.Type.Arch)
 
 			// Verify disks
 			assert.Len(t, domain.Devices.Disks, 2)
@@ -1025,18 +1299,18 @@ func TestCreateDomainXML(t *testing.T) {
 	}{
 		{
 			name:         "s390x architecture",
-			arch:         "s390x",
-			expectedArch: "s390x",
+			arch:         archS390x,
+			expectedArch: archS390x,
 		},
 		{
 			name:         "aarch64 architecture",
-			arch:         "aarch64",
-			expectedArch: "aarch64",
+			arch:         archAArch64,
+			expectedArch: archAArch64,
 		},
 		{
 			name:         "x86_64 architecture (default)",
-			arch:         "x86_64",
-			expectedArch: "x86_64",
+			arch:         archX86_64,
+			expectedArch: archX86_64,
 		},
 	}
 
@@ -1045,14 +1319,14 @@ func TestCreateDomainXML(t *testing.T) {
 			// Create appropriate mock capabilities using helper function
 			var mockCaps *libvirtxml.Caps
 			switch tt.arch {
-			case "s390x":
-				mockCaps = createMockCaps("s390x", "/usr/bin/qemu-system-s390x",
+			case archS390x:
+				mockCaps = createMockCaps(archS390x, "/usr/bin/qemu-system-s390x",
 					libvirtxml.CapsGuestMachine{Name: "s390-ccw-virtio", Canonical: "s390-ccw-virtio-rhel9.0.0"})
-			case "aarch64":
-				mockCaps = createMockCaps("aarch64", "/usr/bin/qemu-system-aarch64",
+			case archAArch64:
+				mockCaps = createMockCaps(archAArch64, "/usr/bin/qemu-system-aarch64",
 					libvirtxml.CapsGuestMachine{Name: "virt", Canonical: "virt-4.2"})
 			default:
-				mockCaps = createMockCaps("x86_64", "/usr/bin/qemu-system-x86_64")
+				mockCaps = createMockCaps(archX86_64, "/usr/bin/qemu-system-x86_64")
 			}
 
 			mockClient := &libvirtClient{
@@ -1087,7 +1361,7 @@ func TestVerifyDomainXMLIOMMU(t *testing.T) {
 			name: "s390x with proper IOMMU on disks and interfaces",
 			domain: &libvirtxml.Domain{
 				OS: &libvirtxml.DomainOS{
-					Type: &libvirtxml.DomainOSType{Arch: "s390x"},
+					Type: &libvirtxml.DomainOSType{Arch: archS390x},
 				},
 				Devices: &libvirtxml.DomainDeviceList{
 					Disks: []libvirtxml.DomainDisk{
@@ -1110,7 +1384,7 @@ func TestVerifyDomainXMLIOMMU(t *testing.T) {
 			name: "s390x missing IOMMU on disk",
 			domain: &libvirtxml.Domain{
 				OS: &libvirtxml.DomainOS{
-					Type: &libvirtxml.DomainOSType{Arch: "s390x"},
+					Type: &libvirtxml.DomainOSType{Arch: archS390x},
 				},
 				Devices: &libvirtxml.DomainDeviceList{
 					Disks: []libvirtxml.DomainDisk{
@@ -1128,7 +1402,7 @@ func TestVerifyDomainXMLIOMMU(t *testing.T) {
 			name: "aarch64 missing IOMMU on interface",
 			domain: &libvirtxml.Domain{
 				OS: &libvirtxml.DomainOS{
-					Type: &libvirtxml.DomainOSType{Arch: "aarch64"},
+					Type: &libvirtxml.DomainOSType{Arch: archAArch64},
 				},
 				Devices: &libvirtxml.DomainDeviceList{
 					Interfaces: []libvirtxml.DomainInterface{
@@ -1146,7 +1420,7 @@ func TestVerifyDomainXMLIOMMU(t *testing.T) {
 			name: "x86_64 does not require IOMMU",
 			domain: &libvirtxml.Domain{
 				OS: &libvirtxml.DomainOS{
-					Type: &libvirtxml.DomainOSType{Arch: "x86_64"},
+					Type: &libvirtxml.DomainOSType{Arch: archX86_64},
 				},
 				Devices: &libvirtxml.DomainDeviceList{
 					Disks: []libvirtxml.DomainDisk{
@@ -1171,4 +1445,386 @@ func TestVerifyDomainXMLIOMMU(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNormalizeRootDiskSize calls the production helper directly so that any
+// change to the defaulting logic in CreateDomain is automatically caught here.
+func TestNormalizeRootDiskSize(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    uint64
+		expected uint64
+	}{
+		{"zero returns default", 0, defaultRootDiskSize},
+		{"explicit 20 GiB preserved", 20, 20},
+		{"minimum 1 GiB preserved", 1, 1},
+		{"large 500 GiB preserved", 500, 500},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, normalizeRootDiskSize(tc.input))
+		})
+	}
+}
+
+// TestVolumeCapacityBytes calls the production helper directly and covers the
+// GiB→bytes conversion, the backing-image floor guard, and overflow detection.
+func TestVolumeCapacityBytes(t *testing.T) {
+	const gib = uint64(1024 * 1024 * 1024)
+
+	testCases := []struct {
+		name                 string
+		volSizeGiB           uint64
+		backingCapacityBytes uint64
+		expectedBytes        uint64
+		wantErr              bool
+	}{
+		{
+			name:                 "requested size larger than backing image",
+			volSizeGiB:           20,
+			backingCapacityBytes: 10 * gib,
+			expectedBytes:        20 * gib,
+		},
+		{
+			name:                 "backing image larger than requested size",
+			volSizeGiB:           10,
+			backingCapacityBytes: 15 * gib,
+			expectedBytes:        15 * gib,
+		},
+		{
+			name:                 "requested size equal to backing image",
+			volSizeGiB:           10,
+			backingCapacityBytes: 10 * gib,
+			expectedBytes:        10 * gib,
+		},
+		{
+			name:                 "GiB to bytes conversion is correct",
+			volSizeGiB:           1,
+			backingCapacityBytes: 0,
+			expectedBytes:        gib,
+		},
+		{
+			// uint64 overflows at volSizeGiB >= 17179869184 (16 EiB).
+			// max uint64 (18446744073709551615) is well above that threshold.
+			name:       "max uint64 GiB overflows",
+			volSizeGiB: ^uint64(0),
+			wantErr:    true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := volumeCapacityBytes(tc.volSizeGiB, tc.backingCapacityBytes)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.expectedBytes, got)
+			}
+		})
+	}
+}
+
+// TestNewDefVolumeCapacity verifies that newDefVolume creates a volume definition
+// with the expected initial capacity.
+func TestNewDefVolumeCapacity(t *testing.T) {
+	testCases := []struct {
+		name         string
+		volName      string
+		expectedUnit string
+	}{
+		{
+			name:         "root volume has bytes capacity unit",
+			volName:      "podvm-root.qcow2",
+			expectedUnit: "bytes",
+		},
+		{
+			name:         "cloudinit volume has bytes capacity unit",
+			volName:      "podvm-cloudinit.iso",
+			expectedUnit: "bytes",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			vol := newDefVolume(tc.volName)
+
+			require.NotNil(t, vol.Capacity, "volume capacity should not be nil")
+			assert.Equal(t, tc.expectedUnit, vol.Capacity.Unit,
+				"volume capacity unit should be bytes")
+			assert.Equal(t, "qcow2", vol.Target.Format.Type,
+				"volume format should be qcow2")
+			assert.Equal(t, tc.volName, vol.Name,
+				"volume name should match input")
+		})
+	}
+}
+
+// TestCreateDomainExistingDomain covers the shut-off sub-case of the adoption path.
+//
+// A domain that was defined but never started has no DHCP lease, so
+// getDomainIPs returns an immediate unrecoverable error ("domain is not
+// running"). The adoption path must propagate that as an error while
+// returning a non-nil instance carrying the UUID so the caller can clean up.
+func TestCreateDomainExistingDomain(t *testing.T) {
+	checkConfig(t)
+
+	client, err := NewLibvirtClient(testCfg)
+	require.NoError(t, err)
+	defer client.connection.Close()
+
+	// Use the host architecture so the XML is accepted on both x86_64 and s390x.
+	hostArch := client.nodeInfo.Model
+	if hostArch == "" {
+		hostArch = archX86_64
+	}
+
+	const domName = "TestCreateDomainExistingShutOff"
+
+	minimalXML := `<domain type='kvm'><name>` + domName + `</name>` +
+		`<memory unit='MiB'>64</memory><vcpu>1</vcpu>` +
+		`<os><type arch='` + hostArch + `'>hvm</type></os></domain>`
+	dom, defErr := client.connection.DomainDefineXML(minimalXML)
+	require.NoError(t, defErr, "failed to pre-create domain for test")
+
+	expectedUUID, uuidErr := dom.GetUUIDString()
+	require.NoError(t, uuidErr)
+	require.NoError(t, dom.Free())
+
+	t.Cleanup(func() {
+		d, lookupErr := client.connection.LookupDomainByName(domName)
+		if lookupErr != nil {
+			return
+		}
+		_ = d.Undefine()
+		_ = d.Free()
+	})
+
+	v := &vmConfig{name: domName}
+	result, createErr := CreateDomain(context.Background(), client, v)
+
+	require.Error(t, createErr, "shut-off domain must return an error")
+	assert.ErrorContains(t, createErr, expectedUUID,
+		"error message must contain the UUID so the caller can log and clean up")
+	require.NotNil(t, result, "result must be non-nil so caller can invoke DeleteInstance")
+	require.NotNil(t, result.instance)
+	assert.Equal(t, expectedUUID, result.instance.instanceID,
+		"instanceID must equal the existing domain UUID for cleanup")
+}
+
+// TestCreateDomainNoExistingDomain verifies that a missing domain falls through to the normal create path.
+func TestCreateDomainNoExistingDomain(t *testing.T) {
+	checkConfig(t)
+
+	client, err := NewLibvirtClient(testCfg)
+	require.NoError(t, err)
+	defer client.connection.Close()
+
+	v := &vmConfig{
+		name:    "TestCreateDomainNonExistent",
+		volName: "nonexistent-backing.qcow2",
+	}
+
+	_, err = CreateDomain(context.Background(), client, v)
+	require.Error(t, err, "expected error from missing volume, not from domain lookup")
+	assert.ErrorContains(t, err, "volume")
+}
+
+func TestWaitForDomainIPs(t *testing.T) {
+	testIP := netip.MustParseAddr("192.168.122.50")
+
+	tests := []struct {
+		name          string
+		retries       uint
+		delay         time.Duration
+		failCount     int // number of attempts returning empty IPs before success; set > retries to never succeed
+		returnErr     error
+		wantErr       bool
+		expectedError string
+		wantCallCount int
+		wantIPs       []netip.Addr
+	}{
+		{
+			name:          "succeeds on first attempt",
+			retries:       5,
+			delay:         10 * time.Millisecond,
+			failCount:     0,
+			wantErr:       false,
+			wantCallCount: 1,
+			wantIPs:       []netip.Addr{testIP},
+		},
+		{
+			name:          "succeeds after retries",
+			retries:       5,
+			delay:         10 * time.Millisecond,
+			failCount:     2,
+			wantErr:       false,
+			wantCallCount: 3,
+			wantIPs:       []netip.Addr{testIP},
+		},
+		{
+			name:          "fails when retries exhausted",
+			retries:       3,
+			delay:         10 * time.Millisecond,
+			failCount:     4, // greater than retries — never succeeds within the budget
+			wantErr:       true,
+			expectedError: "domain has no IPs assigned yet",
+			wantCallCount: 3,
+		},
+		{
+			name:          "fails immediately on unrecoverable error without retrying",
+			retries:       5,
+			delay:         10 * time.Millisecond,
+			returnErr:     errors.New("fatal libvirt query failure"),
+			wantErr:       true,
+			expectedError: "internal error on getting domain IPs: fatal libvirt query failure",
+			wantCallCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callCount := 0
+			getIPs := func() ([]netip.Addr, error) {
+				callCount++
+				if tt.returnErr != nil {
+					return nil, tt.returnErr
+				}
+				if callCount <= tt.failCount {
+					return []netip.Addr{}, nil
+				}
+				return []netip.Addr{testIP}, nil
+			}
+
+			ips, err := waitForDomainIPs(context.Background(), getIPs, tt.retries, tt.delay)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, ips)
+				if tt.expectedError != "" {
+					assert.ErrorContains(t, err, tt.expectedError)
+				}
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantIPs, ips)
+			}
+			assert.Equal(t, tt.wantCallCount, callCount)
+		})
+	}
+}
+
+// TestWaitForDomainIPs_ContextCancellation verifies that context cancellation
+// aborts domain IP polling promptly.
+func TestWaitForDomainIPs_ContextCancellation(t *testing.T) {
+	testIP := netip.MustParseAddr("192.168.122.50")
+
+	t.Run("pre-cancelled context aborts without calling getIPs", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		callCount := 0
+		getIPs := func() ([]netip.Addr, error) {
+			callCount++
+			return []netip.Addr{testIP}, nil
+		}
+
+		ips, err := waitForDomainIPs(ctx, getIPs, 5, 10*time.Millisecond)
+		require.Error(t, err)
+		assert.Nil(t, ips)
+		assert.Equal(t, 0, callCount, "should not call getIPs if context is already cancelled")
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("mid-flight cancellation stops retries", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		callCount := 0
+		getIPs := func() ([]netip.Addr, error) {
+			callCount++
+			if callCount == 2 {
+				cancel()
+			}
+			return []netip.Addr{}, nil
+		}
+
+		ips, err := waitForDomainIPs(ctx, getIPs, 10, 20*time.Millisecond)
+		require.Error(t, err)
+		assert.Nil(t, ips)
+		assert.LessOrEqual(t, callCount, 3, "retries must stop promptly after cancellation")
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+// TestCreateDomainBootFailureReturnsInstanceForCleanup verifies that CreateDomain returns
+// a non-nil result with a populated instanceID when the VM crashes immediately after
+// starting, so the caller can invoke DeleteDomain for cleanup.
+func TestCreateDomainBootFailureReturnsInstanceForCleanup(t *testing.T) {
+	checkConfig(t)
+
+	client, err := NewLibvirtClient(testCfg)
+	require.NoError(t, err)
+	defer client.connection.Close()
+
+	const baseVolName = "TestBootFailure-base.qcow2"
+	const domName = "TestCreateDomainBootFailure"
+
+	pool, err := client.connection.LookupStoragePoolByName(client.poolName)
+	require.NoError(t, err, "storage pool %q not found", client.poolName)
+	defer pool.Free() //nolint:errcheck
+
+	// Remove any stale volume from a previous interrupted run.
+	if stale, lerr := pool.LookupStorageVolByName(baseVolName); lerr == nil {
+		_ = stale.Delete(0)
+		_ = stale.Free()
+	}
+
+	// 3-byte garbage file: libvirt accepts it but QEMU crashes immediately on start,
+	// leaving the domain defined-but-shut-off with no IP.
+	volXML := `<volume type='file'><name>` + baseVolName + `</name>` +
+		`<capacity unit='bytes'>4096</capacity>` +
+		`<target><format type='qcow2'/></target></volume>`
+	baseVol, err := pool.StorageVolCreateXML(volXML, 0)
+	require.NoError(t, err)
+	defer func() {
+		if v, lerr := getVolume(client, baseVolName); lerr == nil {
+			_ = v.Delete(0)
+			_ = v.Free()
+		}
+	}()
+
+	stream, err := client.connection.NewStream(0)
+	require.NoError(t, err)
+	require.NoError(t, baseVol.Upload(stream, 0, 3, 0))
+	_, err = stream.Send([]byte("abc"))
+	require.NoError(t, err)
+	require.NoError(t, stream.Finish())
+	require.NoError(t, stream.Free())
+	require.NoError(t, baseVol.Free())
+
+	if d, lerr := client.connection.LookupDomainByName(domName); lerr == nil {
+		_ = d.Destroy()
+		_ = d.Undefine()
+		_ = d.Free()
+	}
+
+	vm := &vmConfig{
+		name:               domName,
+		cpu:                1,
+		mem:                512,
+		rootDiskSize:       1,
+		volName:            baseVolName,
+		launchSecurityType: NoLaunchSecurity,
+	}
+
+	result, createErr := CreateDomain(context.Background(), client, vm)
+
+	require.Error(t, createErr)
+	require.NotNil(t, result)
+	require.NotNil(t, result.instance)
+	assert.NotEmpty(t, result.instance.instanceID)
+
+	cleanupErr := DeleteDomain(context.Background(), client, result.instance.instanceID)
+	assert.NoError(t, cleanupErr)
+	_, lookupErr := client.connection.LookupDomainByName(domName)
+	assert.Error(t, lookupErr, "domain must be removed by DeleteDomain")
 }

@@ -6,6 +6,10 @@ provider: azure
 
 providerConfigs:
   azure:
+    # Network Subnet Id used for the Pod VM's secondary NIC when external pod networking (EXTERNAL_NETWORK_VIA_PODVM) is enabled
+    # (default: "")
+    # AZURE_EXTERNAL_SUBNET_ID: ""
+
     # Image Id
     # (required)
     AZURE_IMAGE_ID: ""
@@ -58,10 +62,6 @@ providerConfigs:
     # (default: "false")
     # DISABLECVM: "false"
 
-    # Enable encrypted scratch space for pod VMs
-    # (default: "false")
-    # ENABLE_SCRATCH_SPACE: "false"
-
     # Enable secure boot for the VMs
     # (default: "false")
     # ENABLE_SECURE_BOOT: "false"
@@ -90,6 +90,10 @@ providerConfigs:
     # (default: "")
     # PODS_DIR: ""
 
+    # Enable developer mode for disabling Peer Pod VM auto delete
+    # (default: "false")
+    # PODVM_DEVELOPER_MODE: "false"
+
     # [EXPERIMENTAL] Comma separated CIDRs for local pod subnets
     # (default: "")
     # POD_SUBNET_CIDRS: ""
@@ -113,6 +117,14 @@ providerConfigs:
     # Custom tags (key=value pairs) to be used for the Pod VMs, comma separated
     # (default: "")
     # TAGS: ""
+
+    # Comma-separated IANA TLS cipher suite names for peer pod connections (not applicable for VersionTLS13)
+    # (default: "")
+    # TLS_CIPHER_SUITES: ""
+
+    # Minimum TLS version for peer pod connections (VersionTLS12 or VersionTLS13)
+    # (default: "")
+    # TLS_MIN_VERSION: ""
 
     # Skip TLS certificate verification - use it only for testing
     # (default: "false")

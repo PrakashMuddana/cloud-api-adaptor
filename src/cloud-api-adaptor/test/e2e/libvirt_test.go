@@ -43,7 +43,6 @@ func TestLibvirtCreatePeerPodContainerWithExternalIPAccess(t *testing.T) {
 	}
 	assert := getLibvirtAssert(t)
 	DoTestCreatePeerPodContainerWithExternalIPAccess(t, testEnv, assert)
-
 }
 
 func TestLibvirtCreatePeerPodContainerWithValidAlternateImage(t *testing.T) {
@@ -287,4 +286,8 @@ func TestLibvirtPodVMWithNoAnnotations(t *testing.T) {
 func TestLibvirtPodWithInitContainer(t *testing.T) {
 	assert := getLibvirtAssert(t)
 	DoTestPodWithInitContainer(t, testEnv, assert)
+}
+
+func TestLibvirtExtendedResourcesAfterRollout(t *testing.T) {
+	DoTestExtendedResourcesAfterRollout(t, testEnv)
 }

@@ -151,21 +151,21 @@ If you don't have a suitable peer pod image, you can either use a prebuilt image
 
 ```bash
 # Run this command in directory src/cloud-api-adaptor
-cd podvm-mkosi
-make ARCH=amd64 DISTRO=ubuntu MEASURED_ROOTFS=yes image
+cd podvm
+make ARCH=amd64 TEE_PLATFORM=tdx image
 ```
 
-This will create an Ubuntu image with TDX support. The resulting qcow2 image will be in `podvm-mkosi/output/qemu_qcow2/image.qcow2`. You can then upload the image to IBM Cloud by running the following command from the root directory of the `cloud-api-adaptor` repository:
+This will create an Ubuntu image with TDX support. The resulting qcow2 image will be in `podvm/build/podvm-ubuntu-amd64.qcow2`. You can then upload the image to IBM Cloud by running the following command from the root directory of the `cloud-api-adaptor` repository:
 
 ```bash
-src/cloud-api-adaptor/ibmcloud/image/import.sh podvm-mkosi/output/qemu_qcow2/image.qcow2 "$REGION"
+src/cloud-api-adaptor/ibmcloud/image/import.sh podvm/build/podvm-ubuntu-amd64.qcow2 "$REGION"
 ```
 
 > [!TIP]
 > If you don't have a TDX enabled image and are unable to build one, you can still run the peer pod demo without attestation. Run the following command to import a prebuilt non-TDX demo image:
 >
 > ```bash
-> src/cloud-api-adaptor/ibmcloud/image/import.sh ghcr.io/confidential-containers/podvm-generic-ubuntu-amd64:latest "$REGION" --platform linux/amd64
+> src/cloud-api-adaptor/ibmcloud/image/import.sh ghcr.io/confidential-containers/podvm-amd64:latest "$REGION" --platform linux/amd64
 > ```
 
 The import script will end with the line: `Image <image-name> with id <image-id> is available`. Make note of the `image-id`, which will be
@@ -266,7 +266,7 @@ cloud-api-adaptor-daemonset-nt4h7                 1/1     Running   0          5
 cloud-api-adaptor-daemonset-txssq                 1/1     Running   0          5m45s
 kata-deploy-7ncjq                                 1/1     Running   0          5m45s
 kata-deploy-w5kfp                                 1/1     Running   0          5m45s
-peerpodctrl-controller-manager-7d94b54bc9-266bw   2/2     Running   0          5m45s
+peerpodctrl-controller-manager-7d94b54bc9-266bw   1/1     Running   0          5m45s
 ```
 
 ## Run a Helloworld sample
@@ -397,8 +397,6 @@ The following instructions can be used to set up a simple Trustee with an HTTP e
     ```
     git clone https://github.com/confidential-containers/trustee.git
     cd trustee
-    openssl genpkey -algorithm ed25519 > kbs/config/private.key
-    openssl pkey -in kbs/config/private.key -pubout -out kbs/config/public.pub
     sudo docker compose up -d
     ```
 
@@ -410,7 +408,7 @@ The following instructions can be used to set up a simple Trustee with an HTTP e
     cat > kbsres1_key1 << EOF
     res1val1
     EOF
-    ./kbs-client --url http://127.0.0.1:8080 config --auth-private-key kbs/config/private.key set-resource --resource-file kbsres1_key1 --path default/kbsres1/key1
+    ./kbs-client --url http://127.0.0.1:8080 config --admin-token-file kbs/config/docker-compose/admin-token set-resource --resource-file kbsres1_key1 --path default/kbsres1/key1
     ```
 
 1. Configure your confidential containers environment to use the Trustee.

@@ -36,6 +36,7 @@ const (
 )
 
 type ServerConfig struct {
+	CloudProvider           string
 	TLSConfig               *tlsutil.TLSConfig
 	SocketPath              string
 	PauseImage              string
@@ -46,7 +47,7 @@ type ServerConfig struct {
 	EnableCloudConfigVerify bool
 	PeerPodsLimitPerNode    int
 	RootVolumeSize          int
-	EnableScratchSpace      bool
+	DeveloperMode           bool
 }
 
 var logger = log.New(log.Writer(), "[adaptor/cloud] ", log.LstdFlags|log.Lmsgprefix)
@@ -88,7 +89,8 @@ func (s *cloudService) removeSandbox(id sandboxID) error {
 }
 
 func NewService(provider provider.Provider, proxyFactory proxy.Factory, workerNode podnetwork.WorkerNode,
-	serverConfig *ServerConfig) Service {
+	serverConfig *ServerConfig,
+) Service {
 	var err error
 
 	s := &cloudService{
@@ -193,6 +195,12 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
 	// Get Pod VM image from annotations
 	image := util.GetImageFromAnnotation(req.Annotations)
 
+	// Get CSI volumes that need to be attached to the PodVM
+	csiVolumes := util.GetCSIVolumesForPod(req.Annotations)
+	if len(csiVolumes) > 0 {
+		logger.Printf("Found %d CSI volumes to attach to PodVM", len(csiVolumes))
+	}
+
 	netNSPath := req.NetworkNamespacePath
 
 	podNetworkConfig, err := s.workerNode.Inspect(netNSPath)
@@ -212,6 +220,7 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
 		GPUs:         gpus,
 		Image:        image,
 		MultiNic:     podNetworkConfig.ExternalNetViaPodVM,
+		Volumes:      csiVolumes,
 	}
 
 	// TODO: server name is also generated in each cloud provider, and possibly inconsistent
@@ -226,10 +235,18 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
 	agentProxy := s.proxyFactory.New(serverName, socketPath)
 
 	daemonConfig := forwarder.Config{
-		PodNamespace: namespace,
-		PodName:      pod,
-		PodNetwork:   podNetworkConfig,
-		TLSClientCA:  string(agentProxy.ClientCA()),
+		PodNamespace:  namespace,
+		PodName:       pod,
+		PodNetwork:    podNetworkConfig,
+		TLSClientCA:   string(agentProxy.ClientCA()),
+		CloudProvider: s.serverConfig.CloudProvider,
+	}
+
+	if s.serverConfig.TLSConfig != nil {
+		// TLS profile is delivered to APF via user-data and is immutable after VM boot.
+		// Profile changes only apply to newly created peer pods.
+		daemonConfig.MinTLSVersion = s.serverConfig.TLSConfig.MinTLSVersion
+		daemonConfig.CipherSuites = s.serverConfig.TLSConfig.CipherSuites
 	}
 
 	if caService := agentProxy.CAService(); caService != nil {
@@ -296,14 +313,6 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
 		cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
 			Path:    paths.InitDataPath,
 			Content: initdataEnc,
-		})
-	}
-
-	// Set encrypted scratch space config
-	if s.serverConfig.EnableScratchSpace {
-		cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
-			Path:    paths.ScratchSpacePath,
-			Content: "",
 		})
 	}
 
@@ -396,7 +405,7 @@ func (s *cloudService) StartVM(ctx context.Context, req *pb.StartVMRequest) (res
 	go func() {
 		defer close(errCh)
 
-		if err := sandbox.agentProxy.Start(context.Background(), serverURL); err != nil {
+		if err := sandbox.agentProxy.Start(context.Background(), serverURL, instance.VolumeDevices); err != nil {
 			logger.Printf("error running agent proxy: %v", err)
 			errCh <- err
 		}
@@ -434,9 +443,16 @@ func (s *cloudService) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.S
 		logger.Printf("stopping agent proxy: %v", err)
 	}
 
-	if err := s.provider.DeleteInstance(ctx, sandbox.instanceID); err != nil {
-		logger.Printf("Error deleting an instance %s: %v", sandbox.instanceID, err)
-	} else if s.ppService != nil {
+	var deleteErr error
+	if s.serverConfig.DeveloperMode {
+		logger.Printf("Running in developer mode, so leaving instance %s running", sandbox.instanceID)
+	} else {
+		if deleteErr = s.provider.DeleteInstance(ctx, sandbox.instanceID); deleteErr != nil {
+			logger.Printf("Error deleting an instance %s: %v", sandbox.instanceID, deleteErr)
+		}
+	}
+
+	if (s.serverConfig.DeveloperMode || deleteErr == nil) && s.ppService != nil {
 		if err := s.ppService.ReleasePeerPod(sandbox.podName, sandbox.podNamespace, sandbox.instanceID); err != nil {
 			logger.Printf("failed to release PeerPod %v", err)
 		}

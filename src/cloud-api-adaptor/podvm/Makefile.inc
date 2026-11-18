@@ -25,8 +25,6 @@ TEE_PLATFORM ?= none
 CDH_RESOURCE_PROVIDER ?= kbs
 SEALED_SECRET ?= yes
 
-AGENT_POLICY ?= yes
-AGENT_POLICY_PATH := $(FILES_DIR)/etc/kata-opa
 DEFAULT_AGENT_POLICY_FILE ?= allow-all.rego
 
 # Run github artifact provenance verifications
@@ -74,6 +72,7 @@ ATTESTATION_AGENT = $(FILES_DIR)/usr/local/bin/attestation-agent
 CONFIDENTIAL_DATA_HUB = $(FILES_DIR)/usr/local/bin/confidential-data-hub
 API_SERVER_REST  = $(FILES_DIR)/usr/local/bin/api-server-rest
 PROCESS_USER_DATA = $(FILES_DIR)/usr/local/bin/process-user-data
+AZURE_READY = $(FILES_DIR)/usr/local/bin/azure-ready
 
 # Allow BINARIES to be overridden externally
 
@@ -81,6 +80,7 @@ BINARIES ?= \
 	$(AGENT_PROTOCOL_FORWARDER) \
 	$(API_SERVER_REST) \
 	$(ATTESTATION_AGENT) \
+	$(AZURE_READY) \
 	$(CONFIDENTIAL_DATA_HUB) \
 	$(KATA_AGENT) \
 	$(PAUSE) \
@@ -158,6 +158,10 @@ $(AGENT_PROTOCOL_FORWARDER): always
 $(PROCESS_USER_DATA): always
 	cd "$(ROOT_DIR)" && ARCH=$(ARCH) $(MAKE) process-user-data
 	install -D --compare "$(ROOT_DIR)/process-user-data" "$@"
+
+$(AZURE_READY): always
+	cd "$(ROOT_DIR)" && ARCH=$(ARCH) $(MAKE) azure-ready
+	install -D --compare "$(ROOT_DIR)/azure-ready" "$@"
 
 $(KATA_AGENT): $(FORCE_TARGET)
 	$(call pull_agent_artifact)

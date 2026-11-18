@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"os"
 
 	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util"
@@ -47,6 +48,14 @@ func getIPs(instance *vmConfig) ([]netip.Addr, error) {
 	return instance.ips, nil
 }
 
+// resolveVolName returns specImage if non-empty, otherwise defaultVol.
+func resolveVolName(defaultVol, specImage string) string {
+	if specImage != "" {
+		return specImage
+	}
+	return defaultVol
+}
+
 func (p *libvirtProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (*provider.Instance, error) {
 
 	var instanceMemory uint
@@ -70,8 +79,25 @@ func (p *libvirtProvider) CreateInstance(ctx context.Context, podName, sandboxID
 		instanceVCPUs = uint(p.serviceConfig.CPU)
 	}
 
+	volName := resolveVolName(p.serviceConfig.VolName, spec.Image)
+	logger.Printf("Choosing %s as libvirt volume for the PodVM image", volName)
+
+	var dataDisks []string
+	for _, vol := range spec.Volumes {
+		if vol.DiskID == "" {
+			continue
+		}
+		if _, err := os.Stat(vol.DiskID); err != nil {
+			return nil, fmt.Errorf("CSI volume %s not accessible: %w", vol.DiskID, err)
+		}
+		dataDisks = append(dataDisks, vol.DiskID)
+	}
+	if len(dataDisks) > 0 {
+		logger.Printf("Attaching %d CSI data disk(s) to PodVM", len(dataDisks))
+	}
+
 	// TODO: Specify the maximum instance name length in Libvirt
-	vm := &vmConfig{name: instanceName, cpu: instanceVCPUs, mem: instanceMemory, userData: userData, firmware: p.serviceConfig.Firmware, cpuset: p.serviceConfig.CPUSet}
+	vm := &vmConfig{name: instanceName, cpu: instanceVCPUs, mem: instanceMemory, rootDiskSize: p.serviceConfig.RootDiskSize, userData: userData, firmware: p.serviceConfig.Firmware, cpuset: p.serviceConfig.CPUSet, volName: volName, dataDisks: dataDisks}
 
 	if p.serviceConfig.DisableCVM {
 		vm.launchSecurityType = NoLaunchSecurity
@@ -83,21 +109,13 @@ func (p *libvirtProvider) CreateInstance(ctx context.Context, podName, sandboxID
 			return nil, fmt.Errorf("[%s] is not a known launch security setting", p.serviceConfig.LaunchSecurity)
 		}
 	} else {
-		vm.launchSecurityType, err = GetLaunchSecurityType(p.serviceConfig.URI)
+		vm.launchSecurityType, err = GetLaunchSecurityType(p.libvirtClient)
 		if err != nil {
 			logger.Printf("unable to determine launch security type [%v]", err)
 			return nil, err
 		}
 	}
 	logger.Printf("LaunchSecurityType: %s", vm.launchSecurityType.String())
-
-	if spec.Image != "" {
-		logger.Printf("Choosing %s as libvirt volume for the PodVM image", spec.Image)
-		p.libvirtClient.volName = spec.Image
-	} else if spec.Image == "" && p.serviceConfig.VolName != p.libvirtClient.volName {
-		logger.Printf("Choosing the default %s as libvirt volume for the PodVM image", p.serviceConfig.VolName)
-		p.libvirtClient.volName = p.serviceConfig.VolName
-	}
 
 	result, err := CreateDomain(ctx, p.libvirtClient, vm)
 	if err != nil {
@@ -142,7 +160,7 @@ func (p *libvirtProvider) CreateInstance(ctx context.Context, podName, sandboxID
 
 func (p *libvirtProvider) DeleteInstance(ctx context.Context, instanceID string) error {
 	if instanceID == "" {
-		return fmt.Errorf("DeleteInstance called with empty instanceID")
+		return fmt.Errorf("cannot delete instance: empty instanceID")
 	}
 
 	err := DeleteDomain(ctx, p.libvirtClient, instanceID)
@@ -154,7 +172,25 @@ func (p *libvirtProvider) DeleteInstance(ctx context.Context, instanceID string)
 }
 
 func (p *libvirtProvider) Teardown() error {
-	return nil
+	if p.libvirtClient == nil {
+		return nil
+	}
+	// Free the pool handle before closing the connection so the refcount
+	// reaches zero. On failure, log and proceed to close the connection.
+	var poolErr error
+	if p.libvirtClient.pool != nil {
+		if poolErr = p.libvirtClient.pool.Free(); poolErr != nil {
+			logger.Printf("failed to free libvirt storage pool handle: %v", poolErr)
+		}
+	}
+	refCount, connErr := p.libvirtClient.connection.Close()
+	if connErr != nil {
+		return fmt.Errorf("failed to close libvirt connection: %w", connErr)
+	}
+	if refCount > 0 {
+		return fmt.Errorf("libvirt connection still has %d remaining references after close", refCount)
+	}
+	return poolErr
 }
 
 func (p *libvirtProvider) ConfigVerifier() error {
@@ -165,15 +201,15 @@ func (p *libvirtProvider) ConfigVerifier() error {
 	}
 
 	if config.PoolName == "" {
-		return fmt.Errorf("PoolName is empty")
+		return fmt.Errorf("pool name is empty")
 	}
 
 	if config.NetworkName == "" {
-		return fmt.Errorf("NetworkName is empty")
+		return fmt.Errorf("network name is empty")
 	}
 
 	if config.VolName == "" {
-		return fmt.Errorf("VolName is empty")
+		return fmt.Errorf("volume name is empty")
 	}
 
 	if config.CPU == 0 {
@@ -181,7 +217,7 @@ func (p *libvirtProvider) ConfigVerifier() error {
 	}
 
 	if config.Memory == 0 {
-		return fmt.Errorf("Memory must be greater than zero")
+		return fmt.Errorf("memory must be greater than zero")
 	}
 
 	if err := validateCPUSet(config.CPUSet); err != nil {

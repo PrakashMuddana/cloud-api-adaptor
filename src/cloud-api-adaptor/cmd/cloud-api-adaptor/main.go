@@ -19,6 +19,7 @@ import (
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/podnetwork/tunneler"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/podnetwork/tunneler/vxlan"
+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util/tlsconfig"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util/tlsutil"
 	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
 
@@ -35,6 +36,25 @@ type daemonConfig struct {
 	networkConfig tunneler.NetworkConfig
 }
 
+func formatTLSWarnings(tlsConfig *tlsutil.TLSConfig, disableTLS bool, tlsCipherSuites string) []string {
+	var warnings []string
+	if disableTLS {
+		warnings = append(warnings, "TLS disabled (--disable-tls). Use only for testing.")
+	} else if tlsConfig != nil {
+		if tlsConfig.SkipVerify {
+			warnings = append(warnings, "TLS certificate verification disabled (--tls-skip-verify). Use only for testing.")
+		}
+		if tlsConfig.MinTLSVersion != "" || len(tlsConfig.CipherSuites) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"TLS profile (TLS_MIN_VERSION=%s, TLS_CIPHER_SUITES=%s) is baked into peer pod VMs at creation time via user-data. "+
+					"Existing peer pods will not pick up profile changes until deleted and recreated.",
+				tlsConfig.MinTLSVersion, tlsCipherSuites,
+			))
+		}
+	}
+	return warnings
+}
+
 func printHelp(out io.Writer) {
 	fmt.Fprintf(out, "Usage: %s <provider-name> [options] | help | version\n", programName)
 	fmt.Fprintln(out)
@@ -48,13 +68,12 @@ func printHelp(out io.Writer) {
 }
 
 func (cfg *daemonConfig) Setup() (cmd.Starter, error) {
-
 	if len(os.Args) < 2 {
 		printHelp(os.Stderr)
 		cmd.Exit(1)
 	}
 
-	//TODO: transition to better CLI library
+	// TODO: transition to better CLI library
 
 	cloudName := os.Args[1]
 
@@ -82,12 +101,12 @@ func (cfg *daemonConfig) Setup() (cmd.Starter, error) {
 	}
 
 	var (
-		disableTLS bool
-		tlsConfig  tlsutil.TLSConfig
+		disableTLS      bool
+		tlsConfig       tlsutil.TLSConfig
+		tlsCipherSuites string
 	)
 
 	cmd.Parse(programName, os.Args[1:], func(flags *flag.FlagSet) {
-
 		flags.Usage = func() {
 			fmt.Fprintf(flags.Output(), "Usage: %s %s [options]\n\n", programName, cloudName)
 			fmt.Fprintf(flags.Output(), "The options for %q are:\n", cloudName)
@@ -105,15 +124,17 @@ func (cfg *daemonConfig) Setup() (cmd.Starter, error) {
 		reg.StringWithEnv(&tlsConfig.CertFile, "cert-file", "", "CERT_FILE", "Client certificate file for custom TLS (e.g. /etc/certificates/client.crt)")
 		reg.StringWithEnv(&tlsConfig.KeyFile, "cert-key", "", "CERT_KEY", "Client key file for custom TLS (e.g. /etc/certificates/client.key)")
 		reg.BoolWithEnv(&tlsConfig.SkipVerify, "tls-skip-verify", false, "TLS_SKIP_VERIFY", "Skip TLS certificate verification - use it only for testing")
+		reg.StringWithEnv(&tlsConfig.MinTLSVersion, "tls-min-version", "", "TLS_MIN_VERSION", "Minimum TLS version for peer pod connections (VersionTLS12 or VersionTLS13)")
+		reg.StringWithEnv(&tlsCipherSuites, "tls-cipher-suites", "", "TLS_CIPHER_SUITES", "Comma-separated IANA TLS cipher suite names for peer pod connections (not applicable for VersionTLS13)")
 		reg.DurationWithEnv(&cfg.serverConfig.ProxyTimeout, "proxy-timeout", proxy.DefaultProxyTimeout, "PROXY_TIMEOUT", "Maximum timeout in minutes for establishing agent proxy connection")
 		reg.StringWithEnv(&cfg.networkConfig.TunnelType, "tunnel-type", podnetwork.DefaultTunnelType, "TUNNEL_TYPE", "Tunnel provider")
 		reg.IntWithEnv(&cfg.networkConfig.VXLAN.Port, "vxlan-port", vxlan.DefaultVXLANPort, "VXLAN_PORT", "VXLAN UDP port number (VXLAN tunnel mode only")
 		reg.StringWithEnv(&cfg.serverConfig.Initdata, "initdata", "", "INITDATA", "Default initdata for all Pods")
 		reg.BoolWithEnv(&cfg.serverConfig.EnableCloudConfigVerify, "cloud-config-verify", false, "CLOUD_CONFIG_VERIFY", "Enable cloud config verify - should use it for production")
 		reg.IntWithEnv(&cfg.serverConfig.PeerPodsLimitPerNode, "peerpods-limit-per-node", 10, "PEERPODS_LIMIT_PER_NODE", "peer pods limit per node (default=10)")
-		reg.BoolWithEnv(&cfg.serverConfig.EnableScratchSpace, "enable-scratch-space", false, "ENABLE_SCRATCH_SPACE", "Enable encrypted scratch space for pod VMs")
 		reg.BoolWithEnv(&cfg.networkConfig.ExternalNetViaPodVM, "ext-network-via-podvm", false, "EXTERNAL_NETWORK_VIA_PODVM", "[EXPERIMENTAL] Enable external networking via pod VM")
 		reg.CustomTypeWithEnv(&cfg.networkConfig.PodSubnetCIDRs, "pod-subnet-cidrs", "", "POD_SUBNET_CIDRS", "[EXPERIMENTAL] Comma separated CIDRs for local pod subnets")
+		reg.BoolWithEnv(&cfg.serverConfig.DeveloperMode, "developer-mode", false, "PODVM_DEVELOPER_MODE", "Enable developer mode for disabling Peer Pod VM auto delete")
 
 		// Flags without environment variable support
 		flags.BoolVar(&disableTLS, "disable-tls", false, "Disable TLS encryption - use it only for testing")
@@ -127,8 +148,24 @@ func (cfg *daemonConfig) Setup() (cmd.Starter, error) {
 
 	fmt.Printf("%s: starting Cloud API Adaptor daemon for %q\n", programName, cloudName)
 
+	if tlsCipherSuites != "" {
+		tlsConfig.CipherSuites = strings.Split(tlsCipherSuites, ",")
+	}
+
+	var tlsConfigPtr *tlsutil.TLSConfig
 	if !disableTLS {
 		cfg.serverConfig.TLSConfig = &tlsConfig
+		tlsConfigPtr = &tlsConfig
+	}
+
+	for _, w := range formatTLSWarnings(tlsConfigPtr, disableTLS, tlsCipherSuites) {
+		fmt.Printf("%s: WARNING: %s\n", programName, w)
+	}
+
+	if !disableTLS && (tlsConfig.MinTLSVersion != "" || len(tlsConfig.CipherSuites) > 0) {
+		if _, err := tlsconfig.ParseTLSOptions(tlsConfig.MinTLSVersion, tlsConfig.CipherSuites); err != nil {
+			return nil, fmt.Errorf("invalid TLS profile: %w", err)
+		}
 	}
 
 	// DEPRECATED: LoadEnv() is now a no-op for all providers.
@@ -154,6 +191,7 @@ func (cfg *daemonConfig) Setup() (cmd.Starter, error) {
 		}
 	}
 
+	cfg.serverConfig.CloudProvider = cloudName
 	server := adaptor.NewServer(provider, &cfg.serverConfig, workerNode)
 
 	return cmd.NewStarter(server), nil
@@ -171,7 +209,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go probe.Start(config.serverConfig.SocketPath)
+	go probe.Start(ctx, config.serverConfig.SocketPath)
 
 	if err := starter.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %s\n", os.Args[0], err)

@@ -38,10 +38,6 @@ providerConfigs:
     # (default: "false")
     # DISABLECVM: "false"
 
-    # Enable encrypted scratch space for pod VMs
-    # (default: "false")
-    # ENABLE_SCRATCH_SPACE: "false"
-
     # [EXPERIMENTAL] Enable external networking via pod VM
     # (default: "false")
     # EXTERNAL_NETWORK_VIA_PODVM: "false"
@@ -69,6 +65,10 @@ providerConfigs:
     # Pod VM ami id
     # (required)
     PODVM_AMI_ID: ""
+
+    # Enable developer mode for disabling Peer Pod VM auto delete
+    # (default: "false")
+    # PODVM_DEVELOPER_MODE: "false"
 
     # Pod VM instance type
     # (default: "m6a.large")
@@ -105,6 +105,14 @@ providerConfigs:
     # Custom tags (key=value pairs) to be used for the Pod VMs, comma separated
     # (default: "")
     # TAGS: ""
+
+    # Comma-separated IANA TLS cipher suite names for peer pod connections (not applicable for VersionTLS13)
+    # (default: "")
+    # TLS_CIPHER_SUITES: ""
+
+    # Minimum TLS version for peer pod connections (VersionTLS12 or VersionTLS13)
+    # (default: "")
+    # TLS_MIN_VERSION: ""
 
     # Skip TLS certificate verification - use it only for testing
     # (default: "false")

@@ -9,13 +9,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/hex"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
 	_ "github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/test/provisioner/azure"
+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/test/utils"
 	log "github.com/sirupsen/logrus"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 )
@@ -28,6 +29,42 @@ func TestDeletePodAzure(t *testing.T) {
 func TestCreateSimplePodAzure(t *testing.T) {
 	t.Parallel()
 	DoTestCreateSimplePod(t, testEnv, assert)
+}
+
+const machineTypeAnnotation = "io.katacontainers.config.hypervisor.machine_type"
+
+// Azure exposes two flavours of confidential VM, distinguished only by the VM
+// size: the DCasv5 family is backed by AMD SEV-SNP and the DCesv6 family by
+// Intel TDX. The pod VM image carries attesters for both, and the provider
+// applies an identical security profile either way, so running the same simple
+// pod on each size is enough to cover both TEEs.
+//
+// Both sizes must be listed in AZURE_INSTANCE_SIZES for the machine_type
+// annotation to be accepted.
+var azureTeeInstanceSizes = []struct {
+	tee  string
+	size string
+}{
+	{tee: "snp", size: "Standard_DC2as_v5"},
+	{tee: "tdx", size: "Standard_DC2es_v6"},
+}
+
+func TestPodOnSpecificTeeAzure(t *testing.T) {
+	for _, tc := range azureTeeInstanceSizes {
+		t.Run(tc.tee, func(t *testing.T) {
+			t.Parallel()
+			annotations := map[string]string{
+				machineTypeAnnotation: tc.size,
+			}
+			pod := NewPod(E2eNamespace, "specific-tee-"+tc.tee, "busybox", getBusyboxTestImage(t),
+				WithCommand([]string{"/bin/sh", "-c", "sleep 3600"}),
+				WithAnnotations(annotations))
+			NewTestCase(t, testEnv, "PodOnSpecificTee", assert, "PodVM is created on "+tc.tee).
+				WithPod(pod).
+				WithExpectedInstanceType(tc.size).
+				Run()
+		})
+	}
 }
 
 func TestCreatePodWithConfigMapAzure(t *testing.T) {
@@ -146,7 +183,10 @@ func TestKbsKeyRelease(t *testing.T) {
 	DoTestKbsKeyRelease(t, testEnv, assert, kbsEndpoint, resourcePath, testSecret)
 }
 
-func TestRemoteAttestation(t *testing.T) {
+// TestRemoteAttestationAzure retrieves a KBS token from inside the pod VM to
+// verify a successful remote attestation, once per TEE. The pod VM is pinned
+// to an instance type since that is what selects the TEE on Azure.
+func TestRemoteAttestationAzure(t *testing.T) {
 	t.Parallel()
 	var kbsEndpoint string
 	if ep := os.Getenv("KBS_ENDPOINT"); ep != "" {
@@ -160,7 +200,30 @@ func TestRemoteAttestation(t *testing.T) {
 			t.Fatalf("GetCachedKbsEndpoint failed with: %v", err)
 		}
 	}
-	DoTestRemoteAttestation(t, testEnv, assert, kbsEndpoint)
+	initdata, err := buildInitdataAnnotation(kbsEndpoint)
+	if err != nil {
+		t.Fatalf("failed to build initdata: %v", err)
+	}
+	image, err := utils.GetImage("curl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// fail on non 200 code, silent, but output on failure
+	cmd := []string{"curl", "-f", "-s", "-S", "-o", "/dev/null", "http://127.0.0.1:8006/aa/token?token_type=kbs"}
+	for _, tc := range azureTeeInstanceSizes {
+		t.Run(tc.tee, func(t *testing.T) {
+			t.Parallel()
+			annotations := map[string]string{
+				InitdataAnnotation:    initdata,
+				machineTypeAnnotation: tc.size,
+			}
+			job := NewJob(E2eNamespace, "remote-attestation-"+tc.tee, 0, image,
+				WithJobCommand(cmd), WithJobAnnotations(annotations))
+			NewTestCase(t, testEnv, "RemoteAttestationAzure", assert, "Received KBS token").
+				WithJob(job).
+				Run()
+		})
+	}
 }
 
 func TestTrusteeOperatorKeyReleaseForSpecificKey(t *testing.T) {
@@ -208,17 +271,18 @@ func TestInitDataMeasurement(t *testing.T) {
 	msmt := hasher.Sum(nil)
 
 	name := "initdata-msmt"
-	image := "quay.io/confidential-containers/test-images:curl-jq"
-
-	// truncate the measurement to 32 bytes
-	strValues := make([]string, len(msmt))
-	for i, v := range msmt {
-		strValues[i] = strconv.Itoa(int(v))
+	image, err := utils.GetImage("curl")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// json array string
-	msStr := "[" + strings.Join(strValues, ",") + "]"
 
-	shCmd := "curl -s \"http://127.0.0.1:8006/aa/evidence?runtime_data=test\" | jq -c '(.quote // .tpm_quote).pcrs[8]'"
+	// The expected measurement as a lowercase hex string.
+	msStr := hex.EncodeToString(msmt)
+
+	// V1 and V2 evidence carry the PCRs as lowercase hex strings under
+	// "tpm_quote". The pre-V1 "quote" key, which held them as JSON integer
+	// arrays, is no longer supported.
+	shCmd := `curl -s "http://127.0.0.1:8006/aa/evidence?runtime_data=test" | jq -r '.tpm_quote.pcrs[8]'`
 	cmd := []string{"sh", "-c", shCmd}
 
 	annotations := map[string]string{

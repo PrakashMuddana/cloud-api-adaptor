@@ -1,31 +1,66 @@
 package util
 
 import (
+	b64 "encoding/base64"
+	"encoding/json"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
+	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
 	cri "github.com/containerd/containerd/pkg/cri/annotations"
 	hypannotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 )
 
-func GetPodName(annotations map[string]string) string {
+// crioSandboxNameKey is the annotation cri-o sets on each container with the
+// name of its sandbox.
+const crioSandboxNameKey = "io.kubernetes.cri-o.SandboxName"
 
-	sandboxName := annotations[cri.SandboxName]
-
-	// cri-o stores the sandbox name in the form of k8s_<pod name>_<namespace>_<uid>_0
-	// Extract the pod name from it.
-	if tmp := strings.Split(sandboxName, "_"); len(tmp) > 1 && tmp[0] == "k8s" {
-		return tmp[1]
+// crioSandboxFields splits a cri-o sandbox name,
+// k8s_<pod name>_<namespace>_<uid>_<attempt>, into its fields, or returns nil
+// when neither annotation holds one. kata passes the name to CreateVM as
+// cri.SandboxName, and cri-o sets crioSandboxNameKey on each container.
+func crioSandboxFields(annotations map[string]string) []string {
+	for _, key := range []string{cri.SandboxName, crioSandboxNameKey} {
+		if fields := strings.Split(annotations[key], "_"); len(fields) > 1 && fields[0] == "k8s" {
+			return fields
+		}
 	}
 
-	return sandboxName
+	return nil
+}
+
+func GetPodName(annotations map[string]string) string {
+
+	if fields := crioSandboxFields(annotations); fields != nil {
+		return fields[1]
+	}
+
+	return annotations[cri.SandboxName]
 }
 
 func GetPodNamespace(annotations map[string]string) string {
 
 	return annotations[cri.SandboxNamespace]
+}
+
+// GetPodUID returns the UID of the pod that owns the sandbox, or "" when the
+// annotations do not identify it.
+func GetPodUID(annotations map[string]string) string {
+	if uid := annotations[cri.SandboxUID]; uid != "" {
+		return uid
+	}
+
+	// cri-o never sets cri.SandboxUID, but its sandbox name carries the UID
+	if fields := crioSandboxFields(annotations); len(fields) == 5 {
+		return fields[3]
+	}
+
+	return ""
 }
 
 // Method to get instance type from annotation
@@ -113,4 +148,99 @@ func Contains(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+var logger = log.New(log.Writer(), "[util/cloud] ", log.LstdFlags|log.Lmsgprefix)
+
+type mountInfoJSON struct {
+	VolumeType string            `json:"volume-type"`
+	Device     string            `json:"device"`
+	FsType     string            `json:"fstype"`
+	Metadata   map[string]string `json:"metadata"`
+	Options    []string          `json:"options"`
+}
+
+var KataDirectVolumesDir = "/run/kata-containers/shared/direct-volumes"
+
+const CSIPluginEscapeQualifiedName = "kubernetes.io~csi"
+
+const CloudVolumesAnnotationKey = "io.confidentialcontainers.org.cloud_volumes"
+
+// CloudVolumeAnnotation is the schema for each entry in the cloud_volumes
+// annotation. It is serialized by the proxy and deserialized by the interceptor.
+type CloudVolumeAnnotation struct {
+	MountPoint string `json:"mount_point"`
+	FSType     string `json:"fs_type"`
+	LUN        string `json:"lun"`
+	// Device is the absolute device path in the pod VM when the cloud provider
+	// reported one at attach time. It takes precedence over LUN-based discovery.
+	Device  string `json:"device,omitempty"`
+	DiskID  string `json:"disk_id"`
+	FSGroup string `json:"fs_group,omitempty"`
+}
+
+// GetCSIVolumesForPod scans the shared direct-volumes directory for
+// mountInfo.json files written by the CSI block driver. Each file
+// describes a cloud volume that should be attached to the PodVM.
+// Volumes are filtered by pod UID (from annotations) to prevent
+// cross-pod volume leakage on multi-tenant nodes.
+func GetCSIVolumesForPod(annotations map[string]string) []provider.CloudVolume {
+	var volumes []provider.CloudVolume
+
+	podUID := GetPodUID(annotations)
+
+	entries, err := os.ReadDir(KataDirectVolumesDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		decodedPath, err := b64.URLEncoding.DecodeString(entry.Name())
+		if err != nil {
+			continue
+		}
+		decodedStr := string(decodedPath)
+
+		if !strings.Contains(decodedStr, "/volumes/"+CSIPluginEscapeQualifiedName+"/") {
+			continue
+		}
+
+		if podUID != "" && !strings.Contains(decodedStr, "/pods/"+podUID+"/") {
+			continue
+		}
+
+		mountInfoPath := filepath.Join(KataDirectVolumesDir, entry.Name(), "mountInfo.json")
+		data, err := os.ReadFile(mountInfoPath)
+		if err != nil {
+			continue
+		}
+
+		var info mountInfoJSON
+		if err := json.Unmarshal(data, &info); err != nil {
+			logger.Printf("WARNING: invalid mountInfo.json in %s: %v", entry.Name(), err)
+			continue
+		}
+
+		volPath := info.Device
+		if info.Metadata != nil {
+			if cp, ok := info.Metadata["cloud-volume-path"]; ok && cp != "" {
+				volPath = cp
+			}
+		}
+
+		if volPath == "" {
+			logger.Printf("WARNING: no disk ID in mountInfo.json for %s", decodedStr)
+			continue
+		}
+
+		volumes = append(volumes, provider.CloudVolume{
+			DiskID: volPath,
+		})
+	}
+
+	return volumes
 }

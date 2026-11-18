@@ -53,7 +53,7 @@ jobs:
   # secrets it should skip the execution of the test job.
   aws-credentials:
     name: Check AWS credentials
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     outputs:
       has_secrets: ${{ steps.check_secrets.outputs.has_secrets }}
     steps:
@@ -72,7 +72,7 @@ jobs:
     name: "AWS e2e tests: (${{ inputs.cluster_type }}, ${{ inputs.container_runtime }})"
     needs: aws-credentials
     if: needs.aws-credentials.outputs.has_secrets == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: src/cloud-api-adaptor
@@ -89,11 +89,12 @@ jobs:
       contents: read  # Required by aws-actions/configure-aws-credentials
     steps:
       - name: Checkout Code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ inputs.git_ref }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Rebase the code
         if: github.event_name == 'pull_request_target'
@@ -119,13 +120,13 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Setup Golang version ${{ env.GO_VERSION }}
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: "**/go.sum"
           cache: false
 
-      - uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+      - uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
         with:
           version: ${{ env.ORAS_VERSION }}
 
@@ -136,12 +137,6 @@ jobs:
           qcow2=$(find ./*.qcow2)
           echo "PODVM_QCOW2=$(pwd)/${qcow2}" >> "$GITHUB_ENV"
         working-directory: src/cloud-api-adaptor/podvm
-
-      - name: Install kustomize
-        run: |
-          command -v kustomize >/dev/null || \
-          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | \
-            sudo bash -s /usr/local/bin
 
       - name: Install Helm
         run: |
@@ -168,7 +163,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-region: us-east-1
           role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}

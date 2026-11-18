@@ -10,56 +10,101 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   caa:
-    uses: ./.github/workflows/caa_build_and_push_all_arches.yaml
+    uses: $/.github/workflows/caa_build_and_push_all_arches.yaml
     with:
       dev_tags: ${{ github.event.release.tag_name }}-dev
       release_tags: ${{ github.event.release.tag_name }}
       git_ref: ${{ github.ref }}
     permissions:
-      contents: read
-      packages: write
-    secrets:
-      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+      contents: read  # Required to checkout code
+      packages: write  # Required to push container images
 
   peerpod-ctrl:
-    uses: ./.github/workflows/peerpod-ctrl_build_and_push_all_arches.yaml
+    uses: $/.github/workflows/peerpod-ctrl_build_and_push_all_arches.yaml
     with:
       image_tags: ${{ github.event.release.tag_name }}
       git_ref: ${{ github.ref }}
     permissions:
       packages: write  # Required for pushing to GitHub Container Registry
-    secrets:
-      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
 
   podvm-images:
-    uses: ./.github/workflows/podvm_publish.yaml
+    strategy:
+      fail-fast: false
+      matrix:
+        debug: [false, true]
+    uses: $/.github/workflows/podvm_publish.yaml
     with:
       git_ref: ${{ github.ref }}
       image_tag: ${{ github.event.release.tag_name }}
+      debug: ${{ matrix.debug }}
     permissions:
       contents: read           # Required for checkout
       packages: write          # Required for pushing to GitHub Container Registry
       id-token: write          # Required for attestation signing
       attestations: write      # Required for persisting attestations
       artifact-metadata: write # Required by podvm_mkosi.yaml to write attestation metadata
-    secrets:
-      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+
+  podvm-azure-images:
+    uses: $/.github/workflows/podvm_azure_image_publish.yaml
+    with:
+      git_ref: ${{ github.ref }}
+      image_version: ${{ github.event.release.tag_name }}
+    permissions:
+      contents: read           # Required for checkout
+      packages: write          # Required for pushing to GitHub Container Registry
+      id-token: write          # Required for attestation signing
+      attestations: write      # Required for persisting attestations
+      artifact-metadata: write # Required by podvm_mkosi.yaml to write attestation metadata
+
+  podvm-byom-binaries:
+    needs: podvm-images  # Depends on podvm-binaries-ubuntu-{arch} images
+    uses: $/.github/workflows/podvm_byom_binaries_publish.yaml
+    with:
+      git_ref: ${{ github.ref }}
+      image_tag: ${{ github.event.release.tag_name }}
+      arch: amd64
+    permissions:
+      contents: read   # Required for checkout
+      packages: write  # Required for pushing to GHCR
+
+  upload-setup-script:
+    name: Upload setup-podvm-byom.sh as release asset
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write  # Required to upload release assets
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Upload setup script to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG_NAME" \
+            src/cloud-api-adaptor/hack/setup-podvm-byom.sh \
+            --clobber
 
   webhook:
-    uses: ./.github/workflows/webhook_image.yaml
+    uses: $/.github/workflows/webhook_image.yaml
     with:
       image_tags: ${{ github.event.release.tag_name }}
       git_ref: ${{ github.ref }}
     permissions:
-      contents: read
-      packages: write
-    secrets:
-      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+      contents: read  # Required to checkout code
+      packages: write  # Required to push container images
 
   peerpods-chart:
-    uses: ./.github/workflows/peerpods-chart_image.yaml
+    uses: $/.github/workflows/peerpods-chart_image.yaml
     with:
       git_ref: ${{ github.event.release.tag_name }}
     permissions:

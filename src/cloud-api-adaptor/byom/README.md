@@ -45,7 +45,7 @@ Here is an example to create a libvirt VM using `virt-install` and capture it's 
 Copy the image to the libvirt image directory.
 
 ```bash
-cp ./build/podvm-fedora-amd64.qcow2 /var/lib/libvirt/images
+cp ./build/podvm-ubuntu-amd64.qcow2 /var/lib/libvirt/images
 ```
 
 Create VM.
@@ -57,9 +57,9 @@ virt-install \
    --memory 2048 \
    --vcpus 1 \
    --import \
-   --os-variant fedora41 \
+   --os-variant ubuntu24.04 \
    --network default \
-   --disk /var/lib/libvirt/images/podvm-fedora-amd64.qcow2 \
+   --disk /var/lib/libvirt/images/podvm-ubuntu-amd64.qcow2 \
    --noautoconsole
 ```
 
@@ -89,24 +89,25 @@ Once you have your VMs ready with IPs, proceed to [deployment](#deployment-confi
 
 If you have existing VMs and want to configure them automatically, follow these steps.
 
-1. Prerequisites
-Ensure the following tools are installed and available in your environment:
-- yq 
-- Golang
-- Docker
+1. Ensure [Docker is installed](https://docs.docker.com/engine/install/ubuntu/) and running on the VM.
 
-2. Save your public SSH key at a known path. The BYOM provider will use this key for verification, and you will need it later when running the setup script.
+2. Save your public SSH key at a known path. The BYOM provider will use this key for verification.
 
-3. Clone the CAA repository
+3. Run the setup script directly on the VM:
+
+```bash
+curl -fsSL https://github.com/confidential-containers/cloud-api-adaptor/releases/latest/download/setup-podvm-byom.sh \
+  | sudo SSH_PUBLIC_KEY_PATH=/home/$USER/.ssh/id_rsa.pub PODVM_BYOM_BINARIES_IMAGE=<image>:<tag> bash
 ```
-git clone https://github.com/confidential-containers/cloud-api-adaptor.git
-cd cloud-api-adaptor/src/cloud-api-adaptor
-```
-4. Execute the setup script
-> You can build your own image with `make podvm-byom-binaries-image`, or skip this step to use a published image.
-```
-SSH_PUBLIC_KEY_PATH=<path-to-public-key> ./hack/setup-podvm-byom.sh
-```
+
+> **Tip:** To inspect the script before running it, download it first:
+> ```bash
+> curl -fsSL -o setup-podvm-byom.sh https://github.com/confidential-containers/cloud-api-adaptor/releases/latest/download/setup-podvm-byom.sh
+> sudo SSH_PUBLIC_KEY_PATH=/home/$USER/.ssh/id_rsa.pub PODVM_BYOM_BINARIES_IMAGE=<image>:<tag> bash setup-podvm-byom.sh
+> ```
+
+> **Custom image:** You can build your own binaries image with `make podvm-byom-binaries-image`
+> and pass it via `PODVM_BYOM_BINARIES_IMAGE=<image>:<tag>`.
 
 Once your VMs are configured, proceed to [deployment](#deployment-configuration).
 
@@ -127,6 +128,9 @@ Configure **SSH_HOST_KEY_ALLOWLIST_DIR** to enable allowlist mode:
 
 - Only accepts pre-approved SSH host keys
 - Rejects connections from VMs not in the allowlist
+
+When deploying with Helm, see [step 3 of the Deployment Configuration](#deployment-configuration)
+— the chart sets `SSH_HOST_KEY_ALLOWLIST_DIR` automatically when host keys are configured.
 
 ## SSH Host Key Management
 
@@ -207,6 +211,41 @@ providerSecrets:
 ```yaml
 VM_POOL_IPS: "<add your IPs here>"
 ```
+**Note:** Changes to `VM_POOL_IPS` require a restart of the Cloud API Adaptor (CAA) daemonset to take effect.
+
+3. *(Optional)* Configure the SSH host key allowlist.
+See [SSH Host Key Management](#ssh-host-key-management) for how to collect the keys.
+
+   **create mode** — add the collected host key files under `hostKeys` in `byom-secrets.yaml`:
+   ```yaml
+   providerSecrets:
+     byom:
+       id_rsa: |
+         -----BEGIN OPENSSH PRIVATE KEY-----
+         ...
+         -----END OPENSSH PRIVATE KEY-----
+       id_rsa_pub: |
+         ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... user@host
+       hostKeys:
+         vm1_ecdsa.pub: |
+           ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNT...
+         vm1_ed25519.pub: |
+           ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+   ```
+   **reference mode** — if you manage secrets externally, create the Secret yourself
+   and reference it by name in your values:
+   ```bash
+   kubectl create secret generic byom-ssh-host-keys \
+     --from-file=vm1_ecdsa.pub \
+     --from-file=vm1_ed25519.pub \
+     -n confidential-containers-system
+   ```
+   ```yaml
+   secrets:
+     mode: reference
+     existingByomHostKeySecretName: byom-ssh-host-keys
+   ```
+   The chart will mount the Secret and inject `SSH_HOST_KEY_ALLOWLIST_DIR` automatically.
 
 ## Deploy
 

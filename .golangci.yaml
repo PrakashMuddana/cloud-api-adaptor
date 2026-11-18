@@ -21,7 +21,6 @@ linters:
     staticcheck:
       checks:
         - all
-        - "-ST1005" # TODO fix "ST1005: error strings should not end with punctuation or newlines" in a later change
   exclusions:
     generated: lax
     presets:
@@ -30,12 +29,12 @@ linters:
       - legacy
       - std-error-handling
     rules:
-      - linters:
-          - staticcheck
-        path: ^src/csi-wrapper/pkg/wrapper/
-        text: 'SA1019: "github.com/golang/protobuf/jsonpb" is deprecated: Use the "google.golang.org/protobuf/encoding/protojson" package instead.'
       - path: (.+)\.go$
         text: declaration of "(err|ctx)" shadows declaration at
+      - linters:
+          - staticcheck
+        text: "ST1005: error strings should not be capitalized"
+        source: '(?:"Azure\b|`Azure\b|"Alibaba\b|`Alibaba\b)'
     paths:
       - third_party$
       - builtin$

@@ -11,6 +11,7 @@ import (
 
 type Config struct {
 	APIKey            string
+	AccountID         string
 	Zone              string
 	ServiceInstanceID string
 	NetworkID         string
@@ -22,6 +23,7 @@ type Config struct {
 	SystemType        string
 	UsePublicIP       bool
 	BuildTimeout      time.Duration
+	DHCPTimeout       time.Duration
 }
 
 func (c Config) Redact() Config {

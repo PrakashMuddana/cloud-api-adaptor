@@ -219,8 +219,8 @@ go mod tidy
 
 ```bash
 cat > Dockerfile <<EOF
-# golang:1.25.11
-ARG BUILDER_BASE=golang@sha256:3965b9511a9bed199f0b4eb146f99c31971a5c0adb3240d9f25e233cbd9e01c8
+# golang:1.26.11
+ARG BUILDER_BASE=golang@sha256:7af425da11f4fc1a9308eb704369e3f6d1c44e35bac0f874a59ade3f20fdc07e
 FROM --platform="\$TARGETPLATFORM" \$BUILDER_BASE AS builder
 RUN apt-get update && apt-get install -y libvirt-dev pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
@@ -235,7 +235,7 @@ COPY --from=builder /work/libvirt/libvirt.so /libvirt.so
 EOF
 
 cd ../ && docker buildx build --platform "linux/amd64" \
- -t quay.io/confidential-containers/libvirt \
+ -t ghcr.io/confidential-containers/libvirt \
  -f libvirt/Dockerfile \
  -o type=local,dest="./libvirt/build" \
  .

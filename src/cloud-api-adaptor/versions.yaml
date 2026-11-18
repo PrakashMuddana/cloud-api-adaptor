@@ -1,36 +1,10 @@
 ---
-# Sources for a base cloud os images
-cloudimg:
-  ubuntu:
-    noble:
-      amd64:
-        url: https://cloud-images.ubuntu.com/releases/noble/release-20250115/ubuntu-24.04-server-cloudimg-amd64.img
-        checksum: "sha256:28d2f9df3ac0d24440eaf6998507df3405142cf94a55e1f90802c78e43d2d9df"
-      s390x:
-        url: https://cloud-images.ubuntu.com/releases/noble/release-20250115/ubuntu-24.04-server-cloudimg-s390x.img
-        checksum: "sha256:367eef35e239ebd123bd00a1fb66cd048604b70bca362eccad1f95b0021d7458"
-      arm64:
-        url: https://cloud-images.ubuntu.com/releases/noble/release-20250115/ubuntu-24.04-server-cloudimg-arm64.img
-        checksum: "sha256:f11282a728ad42f8bfe0b646a6807674d79a019bfc229d80032345dd3228a2db"
-  rhel:
-    9: # dummy links, get trial image from: https://www.redhat.com/en/technologies/linux-platforms/enterprise-linux/server/trial
-      amd64:
-        url: https://access.redhat.com/downloads/content/479/ver=/rhel---9/9.4/x86_64/product-software
-        checksum: "sha256:d362e72518a2d7415d850b8177c814f6fd87f42ca1640bda17e98855e1d6baad"
-      s390x:
-        url: https://access.redhat.com/downloads/content/72/ver=/rhel---9/9.4/s390x/product-software
-        checksum: "sha256:e1f1868484db0b7b2fedc708b8a589a4ebbe341fae142d776cba1475d4a93642"
-  alinux:
-    3:
-      amd64:
-        url: "https://alinux3.oss-cn-hangzhou.aliyuncs.com/aliyun_3_x64_20G_nocloud_alibase_20250117.qcow2"
-        checksum: "sha256:73c7631c6a48b182e80c7c808d7e3adab3f07ad517fcf5d5eff8f3815306e37e"
 
 tools:
   cert-manager: v1.15.3
   bats: 1.10.0
   iptables-wrapper: bfef9e5087a198b50a4124bb9ce9d2c7c99025dd
-  golang: 1.25.11
+  golang: 1.26.11
   kcli: 99.0.202507200957
   mkosi: v26
   protoc: 3.16.0
@@ -48,7 +22,7 @@ git:
     reference: v1.5.0
   kbs:
     url: https://github.com/confidential-containers/trustee
-    reference: d4e317620c4039c89779b725f74974d8f005da66
+    reference: 512fed65642015b849f38fb13bfdec7806639987
 # If a tag is given it will attempt to pull the oci image by tag. if a
 # reference is specified the corresponding tag will be constructed using
 # the reference and suffixes like architecture or tee.
@@ -58,7 +32,7 @@ oci:
     tag: "3.9"
   kata-containers:
     registry: ghcr.io/kata-containers/cached-artefacts
-    reference: bef049d07e34d467b3a0910fdc65f30aa4647a0a # v3.31.0 + tagging fix
+    reference: d130fbdb929291c8c8c60cf5fdf7cbc7b06d02f9
   guest-components:
     registry: ghcr.io/confidential-containers/guest-components
-    reference: f1561038b9a58d309a3366cc8e25d8e6162424a0
+    reference: 258351fa000837ebfc20cd2ca2d1dc18f8f7ca3e

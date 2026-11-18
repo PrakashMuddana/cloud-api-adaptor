@@ -27,6 +27,14 @@ secrets:
   # - byom: must contain id_rsa (private key) and id_rsa.pub (public key)
   existingSshKeySecretName: ""
 
+  # Name of a pre-existing Secret containing SSH host public keys for BYOM allowlist mode.
+  # Only used when mode: "reference" and provider is "byom".
+  # In create mode, supply host keys via providerSecrets.byom.hostKeys instead —
+  # Helm will create the Secret automatically.
+  # When configured (either mode), the chart mounts the Secret at /etc/byom/ssh-host-keys
+  # and automatically injects SSH_HOST_KEY_ALLOWLIST_DIR — no manual env var needed.
+  existingByomHostKeySecretName: ""
+
   # TLS certificates for CAA-to-peer-pod communication.
   #
   # TLS between CAA and agent-protocol-forwarder is always enabled. By default,
@@ -79,11 +87,24 @@ secrets:
 #
 # Note: libvirt provider files override this with the dev image.
 image:
-  name: quay.io/confidential-containers/cloud-api-adaptor
+  name: ghcr.io/confidential-containers/cloud-api-adaptor
   tag: "latest"
 
 # Cloud provider: libvirt, aws, azure, byom, gcp, ibmcloud, vsphere
 provider: libvirt
+
+# TLS profile for CAA and peer pod connections.
+# When set, these values are injected into the peer-pods-cm ConfigMap as
+# TLS_MIN_VERSION and TLS_CIPHER_SUITES env vars consumed by the CAA DaemonSet.
+# On managed platforms, the operator injects these directly and this section
+# is not needed.
+tlsProfile:
+  # Minimum TLS version. Accepts "VersionTLS12" or "VersionTLS13".
+  # Defaults to TLS 1.2 when empty.
+  minVersion: ""
+  # Comma-separated IANA cipher suite names.
+  # Must not be set when minVersion is VersionTLS13.
+  cipherSuites: ""
 
 # Maximum number of peer pods allowed to run simultaneously
 # This limit prevents resource exhaustion on the cloud provider
@@ -133,6 +154,30 @@ resourceCtrl:
 webhook:
   enabled: true
 
+# GCP-specific configuration
+gcp:
+  # Workload Identity Federation (WIF) for GCP direct authentication
+  # Enables the cloud-api-adaptor daemonset to authenticate to GCP without static JSON keys,
+  # even when running with hostNetwork: true (which bypasses GKE's metadata server proxy).
+  #
+  # Set enable: true and fill in serviceAccount/workloadPool/cluster below.
+  # The chart auto-generates GCP_WIF_CREDENTIALS (contains no secrets, only public config).
+  #
+  # NOTE: WIF is intended for secrets.mode: "create" only. In "reference" mode you
+  # must create the secret manually with GCP_WIF_CREDENTIALS set to the WIF JSON
+  # (not officially suggested).
+  workloadIdentityFederation:
+    # Enable GCP Workload Identity Federation (mounts K8s SA token volume)
+    enable: false
+    # GCP service account email to impersonate (e.g., "caa@my-project.iam.gserviceaccount.com")
+    serviceAccount: ""
+    # GCP project workload identity pool (e.g., "my-project.svc.id.goog")
+    # Used for the projected token audience.
+    workloadPool: ""
+    # Workload identity pool cluster identifier (e.g., "//iam.googleapis.com/projects/123.../providers/...")
+    # Used for the credentials JSON audience field.
+    cluster: ""
+
 # kata-deploy subchart configuration
 kata-deploy:
   # Installs kata and the kata-remote RuntimeClass required by peer pods.
@@ -147,37 +192,22 @@ kata-deploy:
     s390x: remote
     ppc64le: remote
   shims:
-    clh:
-      enabled: false
-    cloud-hypervisor:
-      enabled: false
-    dragonball:
-      enabled: false
-    fc:
-      enabled: false
-    qemu:
-      enabled: false
-    qemu-runtime-rs:
-      enabled: false
-    qemu-nvidia-gpu:
-      enabled: false
-    qemu-nvidia-gpu-snp:
-      enabled: false
-    qemu-nvidia-gpu-tdx:
-      enabled: false
-    qemu-snp:
-      enabled: false
-    qemu-tdx:
-      enabled: false
-    qemu-se:
-      enabled: false
-    qemu-se-runtime-rs:
-      enabled: false
-    qemu-cca:
-      enabled: false
-    qemu-coco-dev:
-      enabled: false
-    qemu-coco-dev-runtime-rs:
-      enabled: false
+    disableAll: true
+    # kata-deploy 0.0.0-dev no longer ships the remote shim in its default
+    # values. Enabling it without this block fails template render:
+    # supportedArches is empty, so the shim would be installed on no node.
+    # Keep this in sync with kata-deploy's try-kata-remote.values.yaml.
     remote:
       enabled: true
+      supportedArches:
+        - amd64
+        - ppc64le
+        - s390x
+      allowedHypervisorAnnotations: []
+      containerd:
+        snapshotter: "nydus"
+      crio:
+        guestPull: true
+      agent:
+        httpsProxy: ""
+        noProxy: ""

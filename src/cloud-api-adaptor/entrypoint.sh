@@ -27,6 +27,10 @@ optionals+=""
 # handled directly by Go code via FlagRegistrar in main.go and no longer need
 # env-to-arg conversion here.
 
+if [[ "${PODVM_DEVELOPER_MODE}" == "true" && -z "${PEERPODS_LIMIT_PER_NODE}" ]]; then
+    optionals+="-peerpods-limit-per-node 1 "
+fi
+
 test_vars() {
     for i in "$@"; do
         [ -z "${!i}" ] && echo "\$$i is NOT set" && EXT=1
@@ -76,11 +80,10 @@ alibabacloud() {
 }
 
 gcp() {
-    test_vars GCP_CREDENTIALS GCP_PROJECT_ID GCP_ZONE PODVM_IMAGE_NAME
+    # Check that at least one authentication method is configured
+    one_of GCP_CREDENTIALS GCP_WIF_CREDENTIALS
 
-    # Avoid using node's metadata service credentials for GCP authentication
-    echo "$GCP_CREDENTIALS" > /tmp/gcp-creds.json
-    export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-creds.json
+    test_vars GCP_PROJECT_ID GCP_ZONE PODVM_IMAGE_NAME
 
     set -x
     exec cloud-api-adaptor gcp ${optionals}

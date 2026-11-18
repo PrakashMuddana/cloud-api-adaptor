@@ -31,6 +31,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
         envFrom:
 {{- if include "peerpods.secretName" . }}
         - secretRef:
@@ -38,7 +42,7 @@ spec:
 {{- end }}
         - configMapRef:
             name: peer-pods-cm
-        image: {{ .Values.image.name | default "quay.io/confidential-containers/cloud-api-adaptor" }}:{{ .Values.image.tag | default "latest" }}
+        image: {{ .Values.image.name | default "ghcr.io/confidential-containers/cloud-api-adaptor" }}:{{ .Values.image.tag | default "latest" }}
         imagePullPolicy: Always
         name: cloud-api-adaptor-con
         securityContext:
@@ -50,6 +54,7 @@ spec:
           httpGet:
             path: /startup
             port: 8000
+            host: 127.0.0.1
           failureThreshold: 30
           periodSeconds: 20
           initialDelaySeconds: 20
@@ -64,6 +69,11 @@ spec:
 {{- if include "peerpods.hasTlsCerts" . }}
         - mountPath: /etc/certificates
           name: certs
+          readOnly: true
+{{- end }}
+{{- if include "peerpods.hasByomHostKeys" . }}
+        - mountPath: /etc/byom/ssh-host-keys
+          name: byom-host-keys
           readOnly: true
 {{- end }}
 {{- if include "peerpods.alibabacloudRrsaEnabled" . }}
@@ -85,11 +95,16 @@ spec:
         # - mountPath: /cloud-providers
         #   name: provider-dir
         # # setting for cloud provider external plugin
-{{- if eq .Values.provider "ibmcloud" }}
         - mountPath: /run/kata-containers/shared/direct-volumes
           name: kata-direct-volumes-dir
+{{- if eq .Values.provider "ibmcloud" }}
         - mountPath: /var/run/secrets/tokens
           name: vault-token
+{{- end }}
+{{- if include "peerpods.gcpWifEnabled" . }}
+        - mountPath: /var/run/secrets/tokens/gcp-ksa
+          name: gcp-wif-token
+          readOnly: true
 {{- end }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -109,6 +124,12 @@ spec:
           defaultMode: 384
           optional: true
           secretName: {{ include "peerpods.tlsSecretName" . }}
+{{- end }}
+{{- if include "peerpods.hasByomHostKeys" . }}
+      - name: byom-host-keys
+        secret:
+          defaultMode: 292
+          secretName: {{ include "peerpods.byomHostKeySecretName" . }}
 {{- end }}
 {{- if include "peerpods.alibabacloudRrsaEnabled" . }}
       - name: rrsa-oidc-token
@@ -140,11 +161,11 @@ spec:
       #     type: Directory
       #   name: provider-dir
       # # setting for cloud provider external plugin
-{{- if eq .Values.provider "ibmcloud" }}
       - name: kata-direct-volumes-dir
         hostPath:
           path: /run/kata-containers/shared/direct-volumes
           type: DirectoryOrCreate
+{{- if eq .Values.provider "ibmcloud" }}
       - name: vault-token
         projected:
           sources:
@@ -152,4 +173,14 @@ spec:
               path: vault-token
               expirationSeconds: 3600
               audience: iam
+{{- end }}
+{{- if include "peerpods.gcpWifEnabled" . }}
+      - name: gcp-wif-token
+        projected:
+          defaultMode: 420
+          sources:
+          - serviceAccountToken:
+              audience: "{{ .Values.gcp.workloadIdentityFederation.workloadPool }}"
+              expirationSeconds: 3600
+              path: token
 {{- end }}

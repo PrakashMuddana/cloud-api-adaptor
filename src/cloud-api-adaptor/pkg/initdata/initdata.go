@@ -23,6 +23,7 @@ type InitDataBody struct {
 type InitData struct {
 	Body   *InitDataBody
 	Digest string
+	TOML   []byte
 }
 
 func digest(alg string, body []byte) (string, error) {
@@ -37,7 +38,7 @@ func digest(alg string, body []byte) (string, error) {
 		hash := sha512.Sum512(body)
 		return hex.EncodeToString(hash[:]), nil
 	default:
-		return "", fmt.Errorf("Error creating initdata digest, algorithm %s is not supported", alg)
+		return "", fmt.Errorf("error creating initdata digest, algorithm %s is not supported", alg)
 	}
 }
 
@@ -71,6 +72,7 @@ func Parse(reader io.Reader) (*InitData, error) {
 	initdata := &InitData{
 		Body:   body,
 		Digest: digest,
+		TOML:   initdataToml,
 	}
 
 	return initdata, nil

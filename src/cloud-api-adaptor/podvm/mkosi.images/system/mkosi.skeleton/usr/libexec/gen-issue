@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Copyright (c) Edgeless Systems GmbH
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# This script reads the measurements of the system
+# and prints it together with helpful information
+# to the serial consol on startup.
+
+set -euo pipefail
+
+main() {
+  mkdir -p /run/issue.d
+  {
+    echo "Detected vTPM PCR values:"
+    /usr/bin/tpm2_pcrread sha256:all
+    echo
+  } > /run/issue.d/30-pcrs.issue
+}
+
+main

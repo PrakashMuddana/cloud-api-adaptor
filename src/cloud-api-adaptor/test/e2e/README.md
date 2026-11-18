@@ -71,14 +71,14 @@ the cached kbs-client.
 We need to build and use the PodVM image:
 
 ```sh
-pushd ${cloud-api-adaptor}/podvm-mkosi
+pushd ${cloud-api-adaptor}/podvm
 make  # builds builder, binaries, and OS image
 # Convert to QCOW2 format if needed for your provider
 qemu-img convert -f raw -O qcow2 build/system.raw build/system.qcow2
 popd
 ```
 
-The resulting image will be at `${cloud-api-adaptor}/podvm-mkosi/build/system.raw` (or `system.qcow2` after conversion). See [podvm-mkosi/README.md](../../podvm-mkosi/README.md) for detailed build instructions.
+The resulting image will be at `${cloud-api-adaptor}/podvm/build/system.raw` (or `system.qcow2` after conversion). See [podvm/README.md](../../podvm/README.md) for detailed build instructions.
 
 To deploy the KBS service and test attestation related cases, export the following variable:
 
@@ -122,7 +122,7 @@ You can use the following command to override the test pods with a relaxed agent
 POD_ALLOW_ALL_POLICY_OVERRIDE=yes TEST_PROVISION=no TEST_INSTALL_CAA=no make CLOUD_PROVIDER=azure TEST_PROVISION_FILE=azure_test.properties test-e2e
 ```
 
-The `POD_ALLOW_ALL_POLICY_OVERRIDE` variable will not override the policy for a test pod if the `io.katacontainers.config.agent.policy` already exists in the pod spec.
+The `POD_ALLOW_ALL_POLICY_OVERRIDE` variable will not override the policy for a test pod if the `io.katacontainers.config.hypervisor.cc_init_data` annotation already exists in the pod spec.
 
 ## Provision file specifics
 
@@ -161,6 +161,40 @@ Use the properties on the table below for AWS:
 a secondary (private) subnet is created with CIDR IPv4 block 10.0.0.128/25
 - The cluster type **onprem** assumes Kubernetes is already provisioned and its kubeconfig file path can be found at the `KUBECONFIG` environment variable or in the `~/.kube/config` file. Whereas **eks** type instructs to create an [AWS EKS](https://aws.amazon.com/eks/) cluster on the VPC
 - You must have `qemu-img` installed in your workstation or CI runner because it is used to convert an qcow2 disk to raw.
+
+### Alibaba Cloud provision properties
+
+Use the properties on the table below for Alibaba Cloud:
+
+|Property|Description|Default|
+|---|---|---|
+|region|Alibaba Cloud region|cn-beijing|
+|alibabacloud_vpc_cidrblock|VPC CIDR block|10.0.0.0/24|
+|alibabacloud_vpc_id|Existing VPC ID||
+|alibabacloud_vpc_sg_id|Existing Security Group ID||
+|alibabacloud_vpc_vswitch_id|Existing vSwitch ID||
+|alibabacloud_zone_id|Preferred zone ID for the vSwitch||
+|CAA_IMAGE|cloud-api-adaptor container image||
+|cluster_type|Kubernetes cluster type. Currently only **onprem** is supported|onprem|
+|container_runtime|Test cluster configured container runtime. Either **containerd** or **crio** |containerd|
+|disablecvm|Set to `true` to disable confidential VM||
+|pause_image|Kubernetes pause image||
+|peerpods_secret_name|Name of the Kubernetes secret for Alibaba credentials. When set, Helm will use reference mode (`secrets.mode=reference`) instead of direct injection. If empty, credentials are passed directly via Helm values||
+|podvm_image_id|ECS custom image ID of the podvm||
+|podvm_instance_type|ECS instance type for the podvm|ecs.g8i.large|
+|ssh_kp_name|ECS SSH key-pair name ||
+|use_public_ip|Set `true` to instantiate VMs with public IP. If `cluster_type=onprem` then this property is implicitly applied||
+|tunnel_type|Tunnel type||
+|vxlan_port|VXLAN port number||
+|resources_basename|Basename used to tag/name created resources||
+
+>Notes:
+
+- Credentials are obtained from the environment (`ALIBABACLOUD_ACCESS_KEY_ID` / `ALIBABACLOUD_ACCESS_KEY_SECRET` / `ALIBABACLOUD_SECURITY_TOKEN`, or the `ALIBABA_CLOUD_*` variants exported by `aliyun/configure-aliyun-credentials-action`). **Important**: access key material is recorded in plain-text in the generated Helm secrets values when not using `peerpods_secret_name`.
+- The vSwitch is created with CIDR IPv4 block 10.0.0.0/25 when using the default VPC CIDR.
+- The cluster type **onprem** assumes Kubernetes is already provisioned and its kubeconfig file path can be found at the `KUBECONFIG` environment variable or in the `~/.kube/config` file.
+- PodVM images are uploaded as QCOW2 to an OSS bucket in the same region and imported via ECS `ImportImage` (UEFI, NvmeSupport). Ensure `AliyunECSImageImportDefaultRole` is configured for the account.
+- CI is triggered by the pull request label `test_e2e_alibabacloud`. Repository secrets `ALIBABA_CLOUD_ROLE_ARN` and `ALIBABA_CLOUD_OIDC_PROVIDER_ARN` must be configured for OIDC authentication.
 
 ### Libvirt provision properties
 

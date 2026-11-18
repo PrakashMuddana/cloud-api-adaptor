@@ -9,9 +9,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/initdata"
 )
 
 var testAPFConfig string = `{
@@ -153,8 +156,6 @@ default WriteStreamRequest := false
 
 var testCheckSum = "52af3178dd7ad4bf551e629b84b45bfd1fbe1434b980120267181ae3575ea20ca9013b8eadf31d27eed7ff2552d500ef"
 var ccInitData = "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"
-
-var testScratchSpaceEnv string = ""
 
 // Test server to simulate the metadata service
 func startTestServer() *httptest.Server {
@@ -338,14 +339,10 @@ func TestProcessCloudConfig(t *testing.T) {
 	var apfCfgPath = filepath.Join(tempDir, "apf.json")
 	var authPath = filepath.Join(tempDir, "auth.json")
 	var initdataPath = filepath.Join(tempDir, "initdata")
-	var scratchSpacePath = filepath.Join(tempDir, "scratch-space.marker")
-	var writeFilesList = []string{aaCfgPath, cdhCfgPath, apfCfgPath, authPath, initdataPath, scratchSpacePath}
+	var writeFilesList = []string{aaCfgPath, cdhCfgPath, apfCfgPath, authPath, initdataPath}
 
 	content := fmt.Sprintf(`#cloud-config
 write_files:
-- path: %s
-  content: |
-%s
 - path: %s
   content: |
 %s
@@ -372,8 +369,6 @@ write_files:
 		indentTextBlock(testAuthJSON, 4),
 		initdataPath,
 		indentTextBlock(ccInitData, 4),
-		scratchSpacePath,
-		indentTextBlock(testScratchSpaceEnv, 4),
 	)
 
 	provider := TestProvider{content: content}
@@ -477,6 +472,7 @@ write_files:
 	cfg := Config{
 		fetchTimeout:  180,
 		digestPath:    "",
+		tomlPath:      "",
 		initdataPath:  "",
 		parentPath:    tempDir,
 		writeFiles:    writeFilesList,
@@ -647,7 +643,7 @@ func TestFailPlainTextUserData(t *testing.T) {
 
 }
 
-func TestExtractInitdataAndHash(t *testing.T) {
+func TestProcessInitdata(t *testing.T) {
 	tempDir, _ := os.MkdirTemp("", "tmp_initdata_root")
 	defer os.RemoveAll(tempDir)
 
@@ -656,11 +652,13 @@ func TestExtractInitdataAndHash(t *testing.T) {
 	var cdhPath = filepath.Join(tempDir, "cdh.toml")
 	var policyPath = filepath.Join(tempDir, "policy.rego")
 	var digestPath = filepath.Join(tempDir, "initdata.digest")
+	var tomlPath = filepath.Join(tempDir, "initdata.toml")
 	var initdDataFilesList = []string{aaPath, cdhPath, policyPath}
 
 	cfg := Config{
 		fetchTimeout:  180,
 		digestPath:    digestPath,
+		tomlPath:      tomlPath,
 		initdataPath:  initdataPath,
 		parentPath:    tempDir,
 		writeFiles:    nil,
@@ -668,33 +666,39 @@ func TestExtractInitdataAndHash(t *testing.T) {
 	}
 
 	_ = writeFile(initdataPath, []byte(ccInitData))
-	err := extractInitdataAndHash(&cfg)
+	err := processInitdata(&cfg)
 	if err != nil {
-		t.Fatalf("extractInitdataAndHash returned err: %v", err)
+		t.Fatalf("processInitdata returned err: %v", err)
 	}
 
 	bytes, _ := os.ReadFile(aaPath)
 	aaStr := string(bytes)
 	if testAAConfig != aaStr {
-		t.Fatalf("extractInitdataAndHash returned: %s does not match %s", aaStr, testAAConfig)
+		t.Fatalf("processInitdata returned: %s does not match %s", aaStr, testAAConfig)
 	}
 
 	bytes, _ = os.ReadFile(cdhPath)
 	cdhStr := string(bytes)
 	if testCDHConfig != cdhStr {
-		t.Fatalf("extractInitdataAndHash returned: %s does not match %s", cdhStr, testCDHConfig)
+		t.Fatalf("processInitdata returned: %s does not match %s", cdhStr, testCDHConfig)
 	}
 
 	bytes, _ = os.ReadFile(policyPath)
 	regoStr := string(bytes)
 	if testPolicyConfig != regoStr {
-		t.Fatalf("extractInitdataAndHash returned: %s does not match %s", regoStr, testPolicyConfig)
+		t.Fatalf("processInitdata returned: %s does not match %s", regoStr, testPolicyConfig)
 	}
 
 	bytes, _ = os.ReadFile(digestPath)
 	sum := string(bytes)
 	if testCheckSum != sum {
-		t.Fatalf("extractInitdataAndHash returned: %s does not match %s", sum, testCheckSum)
+		t.Fatalf("processInitdata returned: %s does not match %s", sum, testCheckSum)
+	}
+
+	bytes, _ = os.ReadFile(tomlPath)
+	decoded, _ := initdata.DecodeAnnotation(ccInitData)
+	if !slices.Equal(bytes, decoded) {
+		t.Fatalf("processInitdata returned: %q does not match %q", bytes, decoded)
 	}
 }
 
@@ -705,20 +709,22 @@ func TestWithoutInitdata(t *testing.T) {
 	var initdataPath = filepath.Join(tempDir, "initdata")
 	var aaPath = filepath.Join(tempDir, "aa.toml")
 	var digestPath = filepath.Join(tempDir, "initdata.digest")
+	var tomlPath = filepath.Join(tempDir, "initdata.toml")
 	var initdDataFilesList = []string{aaPath}
 
 	cfg := Config{
 		fetchTimeout:  180,
 		digestPath:    digestPath,
+		tomlPath:      tomlPath,
 		initdataPath:  initdataPath,
 		parentPath:    tempDir,
 		writeFiles:    nil,
 		initdataFiles: initdDataFilesList,
 	}
 
-	err := extractInitdataAndHash(&cfg)
+	err := processInitdata(&cfg)
 	if err != nil {
-		t.Fatalf("extractInitdataAndHash returned err: %v", err)
+		t.Fatalf("processInitdata returned err: %v", err)
 	}
 
 	// Verify dummy initdata file was created
@@ -743,9 +749,18 @@ func TestWithoutInitdata(t *testing.T) {
 	if len(digestBytes) == 0 {
 		t.Fatalf("digest file should not be empty")
 	}
+
+	// Verify digest was created
+	tomlBytes, err := os.ReadFile(tomlPath)
+	if err != nil {
+		t.Fatalf("failed to read toml file: %v", err)
+	}
+	if len(tomlBytes) == 0 {
+		t.Fatalf("toml file should not be empty")
+	}
 }
 
-func TestExtractInitdataWithMalicious(t *testing.T) {
+func TestProcessInitdataWithMaliciousFile(t *testing.T) {
 	tempDir, _ := os.MkdirTemp("", "tmp_initdata_root")
 	defer os.RemoveAll(tempDir)
 
@@ -754,11 +769,13 @@ func TestExtractInitdataWithMalicious(t *testing.T) {
 	var cdhPath = filepath.Join(tempDir, "cdh.toml")
 	var policyPath = filepath.Join(tempDir, "malicious.rego")
 	var digestPath = filepath.Join(tempDir, "initdata.digest")
+	var tomlPath = filepath.Join(tempDir, "initdata.toml")
 	var initdDataFilesList = []string{aaPath, cdhPath, policyPath}
 
 	cfg := Config{
 		fetchTimeout:  180,
 		digestPath:    digestPath,
+		tomlPath:      tomlPath,
 		initdataPath:  initdataPath,
 		parentPath:    tempDir,
 		writeFiles:    nil,
@@ -766,25 +783,78 @@ func TestExtractInitdataWithMalicious(t *testing.T) {
 	}
 
 	_ = writeFile(initdataPath, []byte(ccInitData))
-	err := extractInitdataAndHash(&cfg)
+	err := processInitdata(&cfg)
 	if err != nil {
-		t.Fatalf("extractInitdataAndHash returned err: %v", err)
+		t.Fatalf("processInitdata returned err: %v", err)
 	}
 
 	bytes, _ := os.ReadFile(aaPath)
 	aaStr := string(bytes)
 	if testAAConfig != aaStr {
-		t.Fatalf("extractInitdataAndHash returned: %s does not match %s", aaStr, testAAConfig)
+		t.Fatalf("processInitdata returned: %s does not match %s", aaStr, testAAConfig)
 	}
 
 	bytes, _ = os.ReadFile(cdhPath)
 	cdhStr := string(bytes)
 	if testCDHConfig != cdhStr {
-		t.Fatalf("extractInitdataAndHash returned: %s does not match %s", cdhStr, testCDHConfig)
+		t.Fatalf("processInitdata returned: %s does not match %s", cdhStr, testCDHConfig)
 	}
 
 	bytes, _ = os.ReadFile(policyPath)
 	if bytes != nil {
 		t.Fatalf("Should not read malicious file but got %s", string(bytes))
+	}
+}
+
+func writeUnit(outputDir, name, contents string) error {
+	path := filepath.Join(outputDir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create directory for %s: %w", name, err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	return nil
+}
+
+func writeFixture(t *testing.T, root, name, contents string) {
+	t.Helper()
+	if err := writeUnit(root, name, contents); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func platformFixture(t *testing.T, vendor, product string) string {
+	t.Helper()
+	root := t.TempDir()
+	writeFixture(t, root, "sys/class/dmi/id/sys_vendor", vendor+"\n")
+	writeFixture(t, root, "sys/class/dmi/id/product_name", product+"\n")
+	return root
+}
+
+func TestDetectCSP(t *testing.T) {
+	tests := []struct {
+		name, vendor, product, csp string
+	}{
+		{"AWS", "Amazon EC2", "c6i.large", "aws"},
+		{"GCP", "Google", "Google Compute Engine", "gcp"},
+		{"GCP product without vendor", "", "Google Compute Engine", "gcp"},
+		{"Alibaba", "Alibaba Cloud", "Alibaba Cloud ECS", "alibaba"},
+		{"Azure", "Microsoft Corporation", "Virtual Machine", "azure"},
+		{"Hyper-V", "Microsoft Corporation", "Hyper-V UEFI Release", "azure"},
+		{"QEMU", "QEMU", "Standard PC (Q35 + ICH9, 2009)", ""},
+		{"libvirt", "Red Hat", "KVM", ""},
+		{"unknown", "Unknown", "Unknown", ""},
+		{"generic KVM", "Unknown", "KVM", ""},
+		{"empty DMI", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := platformFixture(t, tt.vendor, tt.product)
+			csp, err := detectCSP(root)
+			if err != nil || csp != tt.csp {
+				t.Fatalf("CSP = %q, error = %v; want %q", csp, err, tt.csp)
+			}
+		})
 	}
 }

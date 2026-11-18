@@ -6,11 +6,13 @@ package gcp
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/netip"
 	"strings"
 
+	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
@@ -24,17 +26,27 @@ import (
 )
 
 var logger = log.New(log.Writer(), "[adaptor/cloud/gcp] ", log.LstdFlags|log.Lmsgprefix)
-var computeScope = "https://www.googleapis.com/auth/compute"
+var cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
 
 const maxInstanceNameLen = 63
 
 type gcpProvider struct {
 	serviceConfig   *Config
 	instancesClient *compute.InstancesClient
+	authCreds       *auth.Credentials
 }
 
 func (p *gcpProvider) ConfigVerifier() error {
 	return nil
+}
+
+// authOptions returns options to use the configured credentials, or nil to
+// use Application Default Credentials.
+func (p *gcpProvider) authOptions() []option.ClientOption {
+	if p.authCreds == nil {
+		return nil
+	}
+	return []option.ClientOption{option.WithAuthCredentials(p.authCreds)}
 }
 
 func NewProvider(config *Config) (provider.Provider, error) {
@@ -43,23 +55,35 @@ func NewProvider(config *Config) (provider.Provider, error) {
 		serviceConfig:   config,
 		instancesClient: nil,
 	}
-	if config.GcpCredentials != "" {
-		creds, err := credentials.NewCredentialsFromJSON(credentials.ServiceAccount, []byte(config.GcpCredentials), &credentials.DetectOptions{
-			Scopes: []string{computeScope},
+	// Workload Identity Federation (external_account) credentials take
+	// precedence over a static service account key when both are provided.
+	gcpCredentials := config.GcpCredentials
+	if config.GcpWifCredentials != "" {
+		gcpCredentials = config.GcpWifCredentials
+	}
+	if gcpCredentials != "" {
+		// Determine the credential type from the JSON's "type" field and reject
+		// anything other than a static key ("service_account") or WIF
+		// ("external_account").
+		credType, err := gcpCredType(gcpCredentials)
+		if err != nil {
+			return nil, err
+		}
+		creds, err := credentials.NewCredentialsFromJSON(credType, []byte(gcpCredentials), &credentials.DetectOptions{
+			Scopes: []string{cloudPlatformScope},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configuration error when using creds: %s", err)
 		}
-		provider.instancesClient, err = compute.NewInstancesRESTClient(context.TODO(), option.WithAuthCredentials(creds))
-		if err != nil {
-			return nil, fmt.Errorf("NewInstancesRESTClient with credentials error: %s", err)
-		}
+		provider.authCreds = creds
 	} else {
-		var err error
-		provider.instancesClient, err = compute.NewInstancesRESTClient(context.TODO())
-		if err != nil {
-			return nil, fmt.Errorf("NewInstancesRESTClient error: %s", err)
-		}
+		logger.Printf("no GCP credentials configured")
+	}
+
+	var err error
+	provider.instancesClient, err = compute.NewInstancesRESTClient(context.TODO(), provider.authOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("NewInstancesRESTClient error: %s", err)
 	}
 
 	if err := provider.updateInstanceSizeSpecList(); err != nil {
@@ -67,6 +91,37 @@ func NewProvider(config *Config) (provider.Provider, error) {
 	}
 
 	return provider, nil
+}
+
+// gcpCredType reads the "type" field of a GCP credentials JSON and returns the
+// matching credentials.CredType. Only "service_account" (a static key) and
+// "external_account" (Workload Identity Federation) are supported; any other
+// type is rejected rather than handed to the auth library. external_account
+// must use a file credential source; url and executable sources are rejected.
+func gcpCredType(credsJSON string) (credentials.CredType, error) {
+	var header struct {
+		Type             string `json:"type"`
+		CredentialSource struct {
+			File       string          `json:"file"`
+			URL        string          `json:"url"`
+			Executable json.RawMessage `json:"executable"`
+		} `json:"credential_source"`
+	}
+	if err := json.Unmarshal([]byte(credsJSON), &header); err != nil {
+		return "", fmt.Errorf("parsing GCP credentials JSON: %w", err)
+	}
+	switch t := credentials.CredType(header.Type); t {
+	case credentials.ServiceAccount:
+		return t, nil
+	case credentials.ExternalAccount:
+		src := header.CredentialSource
+		if src.File == "" || src.URL != "" || src.Executable != nil {
+			return "", fmt.Errorf("external_account credentials must use a file credential_source")
+		}
+		return t, nil
+	default:
+		return "", fmt.Errorf("unsupported GCP credential type %q: only service_account and external_account are supported", header.Type)
+	}
 }
 
 func parseIPString(ipStr string) (netip.Addr, error) {
@@ -122,13 +177,13 @@ func getIPs(intfcs []*computepb.NetworkInterface, usePublicIPs bool) ([]netip.Ad
 }
 
 func (p *gcpProvider) ListAllTags(ctx context.Context) (map[string]map[string]*resourcemanagerpb.TagValue, error) {
-	tagKeysClient, err := crm.NewTagKeysClient(ctx)
+	tagKeysClient, err := crm.NewTagKeysClient(ctx, p.authOptions()...)
 	if err != nil {
 		return nil, err
 	}
 	defer tagKeysClient.Close()
 
-	tagValuesClient, err := crm.NewTagValuesClient(ctx)
+	tagValuesClient, err := crm.NewTagValuesClient(ctx, p.authOptions()...)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +215,7 @@ func (p *gcpProvider) ListAllTags(ctx context.Context) (map[string]map[string]*r
 }
 
 func (p *gcpProvider) getImageSizeGB(ctx context.Context, image string) (int64, error) {
-	client, err := compute.NewImagesRESTClient(ctx)
+	client, err := compute.NewImagesRESTClient(ctx, p.authOptions()...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create compute client: %w", err)
 	}
@@ -200,7 +255,7 @@ func (p *gcpProvider) getImageSizeGB(ctx context.Context, image string) (int64, 
 
 	img, err := client.Get(ctx, req)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to get image for %s: %w", image, err)
+		return 0, fmt.Errorf("failed to get image for %s: %w", image, err)
 	}
 
 	return img.GetDiskSizeGb(), nil
@@ -212,7 +267,7 @@ func (p *gcpProvider) selectMachineType(ctx context.Context, spec provider.Insta
 }
 
 func (p *gcpProvider) updateInstanceSizeSpecList() error {
-	machineTypeClient, err := compute.NewMachineTypesRESTClient(context.TODO())
+	machineTypeClient, err := compute.NewMachineTypesRESTClient(context.TODO(), p.authOptions()...)
 	if err != nil {
 		return err
 	}
@@ -264,7 +319,7 @@ func (p *gcpProvider) CreateInstance(ctx context.Context, podName, sandboxID str
 	// Otherwise, abort the instance creation
 	allTags, err := p.ListAllTags(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("Aborting: Failed to list tags: %w", err)
+		return nil, fmt.Errorf("aborting: failed to list tags: %w", err)
 	}
 
 	allTagValues := make([]*resourcemanagerpb.TagValue, 0)
@@ -305,7 +360,7 @@ func (p *gcpProvider) CreateInstance(ctx context.Context, podName, sandboxID str
 
 	imageSizeGB, err := p.getImageSizeGB(ctx, *srcImage)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get image size: %w", err)
+		return nil, fmt.Errorf("failed to get image size: %w", err)
 	}
 
 	// If user provided RootVolumeSize, use the larger of the two
@@ -339,17 +394,20 @@ func (p *gcpProvider) CreateInstance(ctx context.Context, podName, sandboxID str
 	}
 
 	networkInterface := &computepb.NetworkInterface{
-		Network: proto.String(p.serviceConfig.Network),
-		AccessConfigs: []*computepb.AccessConfig{
-			{
-				Name:        proto.String("External NAT"),
-				NetworkTier: proto.String("STANDARD"),
-			},
-		},
+		Network:   proto.String(p.serviceConfig.Network),
 		StackType: proto.String("IPV4_Only"),
 	}
 	if subnetworkValue != nil {
 		networkInterface.Subnetwork = subnetworkValue
+	}
+
+	if p.serviceConfig.UsePublicIP {
+		networkInterface.AccessConfigs = []*computepb.AccessConfig{
+			{
+				Name:        proto.String("External NAT"),
+				NetworkTier: proto.String("STANDARD"),
+			},
+		}
 	}
 
 	instanceResource := &computepb.Instance{
@@ -390,7 +448,7 @@ func (p *gcpProvider) CreateInstance(ctx context.Context, podName, sandboxID str
 
 	if !p.serviceConfig.DisableCVM {
 		if p.serviceConfig.ConfidentialType == "" {
-			return nil, fmt.Errorf("ConfidentialType must be set when using Confidential VM.")
+			return nil, fmt.Errorf("ConfidentialType must be set when using Confidential VM")
 		}
 
 		instanceResource.ConfidentialInstanceConfig = &computepb.ConfidentialInstanceConfig{
@@ -449,9 +507,10 @@ func (p *gcpProvider) CreateInstance(ctx context.Context, podName, sandboxID str
 	// Binding all the tagValues to the instance that was already created
 	// Specific endpoint is needed for tag bindings because global endpoint
 	// doesn't work for zonal resources.
-	tagBindingsClient, err := crm.NewTagBindingsClient(ctx,
+	tagBindingsOpts := append(p.authOptions(),
 		option.WithEndpoint(fmt.Sprintf("%s-cloudresourcemanager.googleapis.com:443", p.serviceConfig.Zone)),
 	)
+	tagBindingsClient, err := crm.NewTagBindingsClient(ctx, tagBindingsOpts...)
 	if err != nil {
 		return instance, fmt.Errorf("failed to create bind client: %w", err)
 	}
@@ -478,7 +537,7 @@ func (p *gcpProvider) CreateInstance(ctx context.Context, podName, sandboxID str
 
 		_, err = op.Wait(ctx)
 		if err != nil {
-			return instance, fmt.Errorf("Long-running operation for tag binding %s failed: %v", tagValue, err)
+			return instance, fmt.Errorf("long-running operation for tag binding %s failed: %v", tagValue, err)
 		}
 
 		logger.Printf("Created tag binding for %s on %s successfully", tagValue, parent)

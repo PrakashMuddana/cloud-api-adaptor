@@ -34,7 +34,9 @@ const (
 var logger = log.New(log.Writer(), "[adaptor/proxy] ", log.LstdFlags|log.Lmsgprefix)
 
 type AgentProxy interface {
-	Start(ctx context.Context, serverURL *url.URL) error
+	// Start serves the agent socket until ctx ends. volumeDevices maps a cloud
+	// volume disk ID to its device path in the pod VM, when the provider knows it.
+	Start(ctx context.Context, serverURL *url.URL, volumeDevices map[string]string) error
 	Ready() chan struct{}
 	Shutdown() error
 	CAService() tlsutil.CAService
@@ -80,7 +82,7 @@ func (p *agentProxy) dial(ctx context.Context, address string) (net.Conn, error)
 		// Create a TLS configuration object
 		config, err := tlsutil.GetTLSConfigFor(p.tlsConfig)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to create tls config: %v", err)
+			return nil, fmt.Errorf("failed to create tls config: %v", err)
 		}
 		// This is important otherwise you'll hit the following error
 		// cannot validate certificate for <IP> because it doesn't contain any IP SAN
@@ -129,7 +131,7 @@ func (p *agentProxy) dial(ctx context.Context, address string) (net.Conn, error)
 	return conn, nil
 }
 
-func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL) error {
+func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL, volumeDevices map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(p.socketPath), os.ModePerm); err != nil {
 		return fmt.Errorf("failed to create parent directories for socket: %s", p.socketPath)
 	}
@@ -148,7 +150,7 @@ func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL) error {
 		return p.dial(ctx, serverURL.Host)
 	}
 
-	proxyService := newProxyService(dialer, p.pauseImage)
+	proxyService := newProxyService(dialer, p.pauseImage, volumeDevices)
 	defer func() {
 		if err := proxyService.Close(); err != nil {
 			logger.Printf("error closing agent proxy connection: %v", err)

@@ -8,37 +8,58 @@ package libvirt
 // Code copied from https://github.com/openshift/cluster-api-provider-libvirt
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"time"
 
 	libvirt "libvirt.org/go/libvirt"
 	libvirtxml "libvirt.org/go/libvirtxml"
 )
 
-// ErrVolumeNotFound is returned when a domain is not found
-var ErrVolumeNotFound = errors.New("Domain not found")
+// ErrVolumeNotFound is returned when a volume is not found
+var ErrVolumeNotFound = errors.New("volume not found")
 
 var waitSleepInterval = 1 * time.Second
 
 // waitTimeout time
 var waitTimeout = 5 * time.Minute
 
-// waitForSuccess wait for success and timeout after 5 minutes.
-func waitForSuccess(errorMessage string, f func() error) error {
+// waitForSuccess calls f repeatedly until it returns nil,
+// the context is cancelled, or waitTimeout elapses (whichever comes first).
+func waitForSuccess(ctx context.Context, errorMessage string, f func() error) error {
 	start := time.Now()
+
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	var lastErr error
 	for {
-		err := f()
-		if err == nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s: %w", errorMessage, err)
+		}
+
+		lastErr = f()
+		if lastErr == nil {
 			return nil
 		}
-		logger.Printf("%s. Re-trying.\n", err)
+		logger.Printf("%s. Re-trying.\n", lastErr)
 
-		time.Sleep(waitSleepInterval)
 		if time.Since(start) > waitTimeout {
-			return fmt.Errorf("%s: %s", errorMessage, err)
+			return fmt.Errorf("%s: %w", errorMessage, lastErr)
+		}
+
+		timer.Reset(waitSleepInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s: %w", errorMessage, ctx.Err())
+		case <-timer.C:
 		}
 	}
 }
@@ -64,11 +85,11 @@ func newDefVolume(name string) libvirtxml.StorageVolume {
 func newDefBackingStoreFromLibvirt(baseVolume *libvirt.StorageVol) (libvirtxml.StorageVolumeBackingStore, error) {
 	baseVolumeDef, err := newDefVolumeFromLibvirt(baseVolume)
 	if err != nil {
-		return libvirtxml.StorageVolumeBackingStore{}, fmt.Errorf("could not get volume: %s", err)
+		return libvirtxml.StorageVolumeBackingStore{}, fmt.Errorf("could not get volume: %w", err)
 	}
 	baseVolPath, err := baseVolume.GetPath()
 	if err != nil {
-		return libvirtxml.StorageVolumeBackingStore{}, fmt.Errorf("could not get base image path: %s", err)
+		return libvirtxml.StorageVolumeBackingStore{}, fmt.Errorf("could not get base image path: %w", err)
 	}
 	backingStoreDef := libvirtxml.StorageVolumeBackingStore{
 		Path: baseVolPath,
@@ -82,15 +103,15 @@ func newDefBackingStoreFromLibvirt(baseVolume *libvirt.StorageVol) (libvirtxml.S
 func newDefVolumeFromLibvirt(volume *libvirt.StorageVol) (libvirtxml.StorageVolume, error) {
 	name, err := volume.GetName()
 	if err != nil {
-		return libvirtxml.StorageVolume{}, fmt.Errorf("could not get name for volume: %s", err)
+		return libvirtxml.StorageVolume{}, fmt.Errorf("could not get name for volume: %w", err)
 	}
 	volumeDefXML, err := volume.GetXMLDesc(0)
 	if err != nil {
-		return libvirtxml.StorageVolume{}, fmt.Errorf("could not get XML description for volume %s: %s", name, err)
+		return libvirtxml.StorageVolume{}, fmt.Errorf("could not get XML description for volume %s: %w", name, err)
 	}
 	volumeDef, err := newDefVolumeFromXML(volumeDefXML)
 	if err != nil {
-		return libvirtxml.StorageVolume{}, fmt.Errorf("could not get a volume definition from XML for %s: %s", volumeDef.Name, err)
+		return libvirtxml.StorageVolume{}, fmt.Errorf("could not get a volume definition from XML for %s: %w", name, err)
 	}
 	return volumeDef, nil
 }
@@ -105,37 +126,47 @@ func newDefVolumeFromXML(s string) (libvirtxml.StorageVolume, error) {
 	return volumeDef, nil
 }
 
-func uploadVolume(libvirtClient *libvirtClient, volumeDef libvirtxml.StorageVolume, img image) (volumeKey string, err error) {
+func uploadVolume(ctx context.Context, libvirtClient *libvirtClient, volumeDef libvirtxml.StorageVolume, img image) (volumeKey string, err error) {
 
 	// Refresh the pool of the volume so that libvirt knows it is
 	// not longer in use.
-	err = waitForSuccess("Error refreshing pool for volume", func() error {
+	err = waitForSuccess(ctx, fmt.Sprintf("error refreshing pool %q for volume", libvirtClient.poolName), func() error {
 		return libvirtClient.pool.Refresh(0)
 	})
 	if err != nil {
-		return "", fmt.Errorf("timeout when calling waitForSuccess: %v", err)
+		return "", err
 	}
 
 	volumeDefXML, err := xml.Marshal(volumeDef)
 	if err != nil {
-		return "", fmt.Errorf("Error serializing libvirt volume: %s", err)
+		return "", fmt.Errorf("error serializing libvirt volume: %w", err)
 	}
 	// create the volume
 	volume, err := libvirtClient.pool.StorageVolCreateXML(string(volumeDefXML), 0)
 	if err != nil {
-		return "", fmt.Errorf("Error creating libvirt volume for device %s: %s", volumeDef.Name, err)
+		return "", fmt.Errorf("error creating libvirt volume for device %s: %w", volumeDef.Name, err)
 	}
+	// Delete the volume on failure before freeing the handle (LIFO).
+	// volume.Free() in freeVolume is safe to call on a deleted volume —
+	// it only decrements the Go-side handle refcount.
 	defer freeVolume(volume, &err)
+	defer func() {
+		if err != nil {
+			if delErr := volume.Delete(0); delErr != nil {
+				logger.Printf("failed to delete orphan volume %s during rollback: %v", volumeDef.Name, delErr)
+			}
+		}
+	}()
 
 	// upload ISO file
 	err = img.importImage(newCopier(libvirtClient.connection, volume, volumeDef.Capacity.Value), volumeDef)
 	if err != nil {
-		return "", fmt.Errorf("Error while uploading volume %s: %s", img.string(), err)
+		return "", fmt.Errorf("error while uploading volume %s: %w", img.string(), err)
 	}
 
 	volumeKey, err = volume.GetKey()
 	if err != nil {
-		return "", fmt.Errorf("Error retrieving volume key: %s", err)
+		return "", fmt.Errorf("error retrieving volume key: %w", err)
 	}
 	logger.Printf("Volume ID: %s", volumeKey)
 	return volumeKey, nil
@@ -182,60 +213,97 @@ func newCopier(conn *libvirt.Connect, volume *libvirt.StorageVol, size uint64) f
 	return copier
 }
 
-func createVolume(volName string, volSize uint64, baseVolName string, libvirtClient *libvirtClient) (err error) {
+const bytesPerGiB = uint64(1024 * 1024 * 1024)
+
+// volumeCapacityBytes returns the capacity in bytes to use for a new volume.
+// It takes the larger of the requested size (converted from GiB) and the
+// backing image's actual capacity.
+//
+// If volSizeGiB is smaller than the backing image, the backing image's size
+// is used instead. This means operators cannot shrink below the base podvm
+// image size — a value of e.g. 5 GiB on a 10 GiB backing image will
+// silently produce a 10 GiB volume. This is intentional: a qcow2 overlay
+// must always be at least as large as its backing store.
+//
+// Returns an error if the GiB→bytes conversion overflows uint64.
+//
+// Extracted as a pure function so the GiB→bytes conversion and the floor
+// guard can be unit-tested independently of libvirt.
+func volumeCapacityBytes(volSizeGiB, backingCapacityBytes uint64) (uint64, error) {
+	hi, requested := bits.Mul64(volSizeGiB, bytesPerGiB)
+	if hi != 0 {
+		return 0, fmt.Errorf("root-disk-size %d GiB overflows uint64 when converted to bytes", volSizeGiB)
+	}
+	return max(requested, backingCapacityBytes), nil
+}
+
+// createVolume creates a qcow2 volume backed by baseVolName.
+// volSizeGiB is the requested size in GiB; libvirt uses the larger of this
+// value and the backing image's actual capacity.
+func createVolume(ctx context.Context, volName string, volSizeGiB uint64, baseVolName string, libvirtClient *libvirtClient) (err error) {
 	volumeDef := newDefVolume(volName)
 	volumeDef.Target.Format.Type = "qcow2"
 
 	baseVolume, err := getVolume(libvirtClient, baseVolName)
 
 	if err != nil {
-		return fmt.Errorf("Can't retrieve volume %s", baseVolName)
+		return fmt.Errorf("can't retrieve volume %s: %w", baseVolName, err)
 	}
 	defer freeVolume(baseVolume, &err)
 
 	var baseVolumeInfo *libvirt.StorageVolInfo
 	baseVolumeInfo, err = baseVolume.GetInfo()
 	if err != nil {
-		return fmt.Errorf("Can't retrieve volume info %s", baseVolName)
+		return fmt.Errorf("can't retrieve volume info %s: %w", baseVolName, err)
 	}
 
-	if baseVolumeInfo.Capacity > volSize {
-		volumeDef.Capacity.Value = baseVolumeInfo.Capacity
-	} else {
-		volumeDef.Capacity.Value = volSize
+	capacityBytes, err := volumeCapacityBytes(volSizeGiB, baseVolumeInfo.Capacity)
+	if err != nil {
+		return fmt.Errorf("invalid volume size: %w", err)
 	}
+	volumeDef.Capacity.Value = capacityBytes
 
 	backingStoreDef, err := newDefBackingStoreFromLibvirt(baseVolume)
 	if err != nil {
-		return fmt.Errorf("Could not retrieve backing store %s", baseVolName)
+		return fmt.Errorf("could not retrieve backing store %s: %w", baseVolName, err)
 	}
 	volumeDef.BackingStore = &backingStoreDef
 
 	volumeDefXML, err := xml.Marshal(volumeDef)
 	if err != nil {
-		return fmt.Errorf("Error serializing libvirt volume: %s", err)
+		return fmt.Errorf("error serializing libvirt volume: %w", err)
 	}
 
 	// create the volume
 	// Refresh the pool of the volume so that libvirt knows it is
 	// not longer in use.
-	err = waitForSuccess("error refreshing pool for volume", func() error {
+	err = waitForSuccess(ctx, fmt.Sprintf("error refreshing pool %q for volume", libvirtClient.poolName), func() error {
 		return libvirtClient.pool.Refresh(0)
 	})
 	if err != nil {
-		return fmt.Errorf("can't find storage pool '%s'", libvirtClient.poolName)
+		return err
 	}
 
 	volume, err := libvirtClient.pool.StorageVolCreateXML(string(volumeDefXML), 0)
 	if err != nil {
-		return fmt.Errorf("Error creating libvirt volume: %s", err)
+		return fmt.Errorf("error creating libvirt volume: %w", err)
 	}
+	// Delete the volume on failure before freeing the handle (LIFO).
+	// volume.Free() in freeVolume is safe to call on a deleted volume —
+	// it only decrements the Go-side handle refcount.
 	defer freeVolume(volume, &err)
+	defer func() {
+		if err != nil {
+			if delErr := volume.Delete(0); delErr != nil {
+				logger.Printf("failed to delete orphan volume %s during rollback: %v", volName, delErr)
+			}
+		}
+	}()
 
 	// we use the key as the id
 	key, err := volume.GetKey()
 	if err != nil {
-		return fmt.Errorf("Error retrieving volume key: %s", err)
+		return fmt.Errorf("error retrieving volume key: %w", err)
 	}
 
 	logger.Printf("Uploaded volume key %s", key)
@@ -251,7 +319,7 @@ func getVolume(libvirtClient *libvirtClient, volumeName string) (*libvirt.Storag
 		// Let's try by ID in case of older Installer
 		volume, err = libvirtClient.connection.LookupStorageVolByKey(volumeName)
 		if err != nil {
-			return nil, fmt.Errorf("can't retrieve volume %q: %v", volumeName, err)
+			return nil, err
 		}
 	}
 	return volume, nil
@@ -270,7 +338,7 @@ func volumeExists(libvirtClient *libvirtClient, volumeName string) (exist bool, 
 	return true, nil
 }
 
-func deleteVolumeByPath(libvirtClient *libvirtClient, path string) (err error) {
+func deleteVolumeByPath(ctx context.Context, libvirtClient *libvirtClient, path string) (err error) {
 
 	// Get volume name from path
 
@@ -289,11 +357,11 @@ func deleteVolumeByPath(libvirtClient *libvirtClient, path string) (err error) {
 		return err
 	}
 
-	return deleteVolume(libvirtClient, name)
+	return deleteVolume(ctx, libvirtClient, name)
 
 }
 
-func deleteVolume(libvirtClient *libvirtClient, name string) (err error) {
+func deleteVolume(ctx context.Context, libvirtClient *libvirtClient, name string) (err error) {
 	exists, err := volumeExists(libvirtClient, name)
 	if err != nil {
 		logger.Printf("Unable to check if volume (%s) exists", name)
@@ -307,7 +375,7 @@ func deleteVolume(libvirtClient *libvirtClient, name string) (err error) {
 
 	volume, err := getVolume(libvirtClient, name)
 	if err != nil {
-		return fmt.Errorf("Can't retrieve volume %s", name)
+		return fmt.Errorf("can't retrieve volume %s: %w", name, err)
 	}
 	defer freeVolume(volume, &err)
 
@@ -315,7 +383,7 @@ func deleteVolume(libvirtClient *libvirtClient, name string) (err error) {
 	// not longer in use.
 	volPool, err := volume.LookupPoolByVolume()
 	if err != nil {
-		return fmt.Errorf("Error retrieving pool for volume: %s", err)
+		return fmt.Errorf("error retrieving pool for volume: %w", err)
 	}
 	defer func() {
 		newErr := volPool.Free()
@@ -324,16 +392,16 @@ func deleteVolume(libvirtClient *libvirtClient, name string) (err error) {
 		}
 	}()
 
-	err = waitForSuccess("Error refreshing pool for volume", func() error {
+	err = waitForSuccess(ctx, "error refreshing pool for volume", func() error {
 		return volPool.Refresh(0)
 	})
 	if err != nil {
-		return fmt.Errorf("timeout when calling waitForSuccess: %v", err)
+		return err
 	}
 
 	err = volume.Delete(0)
 	if err != nil {
-		return fmt.Errorf("Can't delete volume %s: %s", name, err)
+		return fmt.Errorf("can't delete volume %s: %w", name, err)
 	}
 
 	return nil

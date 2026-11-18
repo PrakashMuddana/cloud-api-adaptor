@@ -557,7 +557,7 @@ func (v *Vpc) setupVpcNetworking() error {
 	)
 
 	if v.SubnetID == "" {
-		return fmt.Errorf("Missing subnet Id to setup the VPC %s network\n", v.ID)
+		return fmt.Errorf("missing subnet Id to setup the VPC %s network", v.ID)
 	}
 
 	if igwOutput, err = v.Client.CreateInternetGateway(context.TODO(),
@@ -999,8 +999,10 @@ func NewAMIImage(client *ec2.Client, properties map[string]string) *AMIImage {
 
 // importEBSSnapshot Imports the disk image into the EBS
 func (i *AMIImage) importEBSSnapshot(bucket *S3Bucket) error {
-	// Create the import snapshot task
-	importSnapshotOutput, err := i.Client.ImportSnapshot(context.TODO(), &ec2.ImportSnapshotInput{
+	// Create the import snapshot task, retrying on IAM propagation delay.
+	// IAM role creation is eventually consistent and EC2 may return InvalidParameter
+	// immediately after CreateRole/PutRolePolicy completes (observed in CI).
+	input := &ec2.ImportSnapshotInput{
 		Description: aws.String("Peer Pod VM disk snapshot"),
 		DiskContainer: &ec2types.SnapshotDiskContainer{
 			Description: aws.String(i.DiskDescription),
@@ -1012,8 +1014,23 @@ func (i *AMIImage) importEBSSnapshot(bucket *S3Bucket) error {
 		},
 		RoleName:          aws.String(i.VMImportRole),
 		TagSpecifications: defaultTagSpecifications(i.BaseName+"-snap", ec2types.ResourceTypeImportSnapshotTask),
-	})
-	if err != nil {
+	}
+	const (
+		maxRetries    = 6
+		retryInterval = 5 * time.Second
+	)
+	var importSnapshotOutput *ec2.ImportSnapshotOutput
+	var err error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		importSnapshotOutput, err = i.Client.ImportSnapshot(context.TODO(), input)
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "does not exist or does not have sufficient permissions") && attempt < maxRetries {
+			log.Infof("ImportSnapshot: IAM role not yet propagated, retrying in %s (attempt %d/%d)", retryInterval, attempt, maxRetries)
+			time.Sleep(retryInterval)
+			continue
+		}
 		return err
 	}
 
@@ -1056,7 +1073,7 @@ func (i *AMIImage) importEBSSnapshot(bucket *S3Bucket) error {
 func (i *AMIImage) registerImage(imageName string) error {
 
 	if i.EBSSnapshotID == "" {
-		return fmt.Errorf("EBS Snapshot ID not found\n")
+		return fmt.Errorf("EBS Snapshot ID not found")
 	}
 
 	result, err := i.Client.RegisterImage(context.TODO(), &ec2.RegisterImageInput{
@@ -1620,7 +1637,7 @@ func (o *OnPremCluster) DeleteCluster() error {
 func (o *OnPremCluster) GetKubeconfigFile() (string, error) {
 	kubeconfigPath := kconf.ResolveKubeConfigFile()
 	if kubeconfigPath == "" {
-		return "", fmt.Errorf("Unabled to find a kubeconfig file")
+		return "", fmt.Errorf("unable to find a kubeconfig file")
 	}
 
 	return kubeconfigPath, nil

@@ -118,6 +118,7 @@ func NewProvider(config *Config) (provider.Provider, error) {
 		c = openapi.Config{
 			AccessKeyId:     tea.String(config.AccessKeyID),
 			AccessKeySecret: tea.String(config.SecretKey),
+			SecurityToken:   tea.String(config.SecurityToken),
 			RegionId:        tea.String(config.Region),
 		}
 	}
@@ -225,9 +226,10 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
 
 	var req *ecs.RunInstancesRequest
 
+	imageID := p.serviceConfig.ImageID
 	if spec.Image != "" {
 		logger.Printf("Choosing %s from annotation as the ECS Image for the PodVM image", spec.Image)
-		p.serviceConfig.ImageID = spec.Image
+		imageID = spec.Image
 	}
 
 	securityGroupIds := []*string{}
@@ -236,16 +238,17 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
 	}
 
 	req = &ecs.RunInstancesRequest{
-		RegionId:         tea.String(p.serviceConfig.Region),
-		MinAmount:        tea.Int32(1),
-		Amount:           tea.Int32(1),
-		ImageId:          tea.String(p.serviceConfig.ImageID),
-		InstanceType:     tea.String(instanceType),
-		SecurityGroupIds: securityGroupIds,
-		VSwitchId:        tea.String(p.serviceConfig.VswitchID),
-		UserData:         tea.String(b64EncData),
-		Tag:              tags,
-		InstanceName:     tea.String(instanceName),
+		RegionId:           tea.String(p.serviceConfig.Region),
+		MinAmount:          tea.Int32(1),
+		Amount:             tea.Int32(1),
+		ImageId:            tea.String(imageID),
+		InstanceType:       tea.String(instanceType),
+		InstanceChargeType: tea.String("PostPaid"), // pay-as-you-go
+		SecurityGroupIds:   securityGroupIds,
+		VSwitchId:          tea.String(p.serviceConfig.VswitchID),
+		UserData:           tea.String(b64EncData),
+		Tag:                tags,
+		InstanceName:       tea.String(instanceName),
 	}
 	if p.serviceConfig.KeyName != "" {
 		req.KeyPairName = tea.String(p.serviceConfig.KeyName)
@@ -267,12 +270,12 @@ func (p *alibabaCloudProvider) CreateInstance(ctx context.Context, podName, sand
 
 	// Add block device mappings to the instance to set the root volume size
 	if p.serviceConfig.SystemDiskSize > 0 {
-		req.ImageId = tea.String(p.serviceConfig.ImageID)
+		req.ImageId = tea.String(imageID)
 		req.SystemDisk = &ecs.RunInstancesRequestSystemDisk{
 			Size:     tea.String(strconv.Itoa(p.serviceConfig.SystemDiskSize)),
 			Category: tea.String("cloud_essd"),
 		}
-		logger.Printf("Setting the SystemDisk size to %d GiB with ImageId %s", p.serviceConfig.SystemDiskSize, p.serviceConfig.ImageID)
+		logger.Printf("Setting the SystemDisk size to %d GiB with ImageId %s", p.serviceConfig.SystemDiskSize, imageID)
 	}
 
 	logger.Printf("CreateInstance: name: %q", instanceName)

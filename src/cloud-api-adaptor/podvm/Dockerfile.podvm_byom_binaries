@@ -1,0 +1,26 @@
+# Copyright Confidential Containers Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Packages prequisites for podvm-byom image
+#
+# Override it via build-args for different platforms
+
+ARG BINARIES_IMG="ghcr.io/confidential-containers/podvm-binaries-ubuntu-amd64"
+
+FROM ${BINARIES_IMG} AS podvm_binaries
+
+# ubuntu:24.04
+FROM ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932 AS builder
+
+COPY --from=podvm_binaries / /src/files
+
+COPY . /src
+
+COPY podvm/mkosi.skeleton-sftp/usr/lib/systemd/system /src/files/etc/systemd/system
+COPY podvm/copy-files.sh /src/files/copy-files.sh
+
+RUN tar czvf /podvm-byom.tar.gz -C /src/files .
+
+FROM scratch
+COPY --from=builder /podvm-byom.tar.gz /

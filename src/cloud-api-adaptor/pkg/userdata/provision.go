@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	retry "github.com/avast/retry-go/v4"
@@ -19,6 +20,7 @@ import (
 const (
 	ConfigParent = "/run/peerpod"
 	DigestPath   = "/run/peerpod/initdata.digest"
+	TOMLPath     = "/run/peerpod/initdata.toml"
 	PolicyPath   = "/run/peerpod/policy.rego"
 	// Ref: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html
 	AWSImdsURL         = "http://169.254.169.254/latest/dynamic/instance-identity/document"
@@ -38,12 +40,13 @@ const (
 )
 
 var logger = log.New(log.Writer(), "[userdata/provision] ", log.LstdFlags|log.Lmsgprefix)
-var WriteFilesList = []string{paths.AACfgPath, paths.CDHCfgPath, paths.ForwarderCfgPath, paths.AuthFilePath, paths.InitDataPath, paths.ScratchSpacePath}
+var WriteFilesList = []string{paths.AACfgPath, paths.CDHCfgPath, paths.ForwarderCfgPath, paths.AuthFilePath, paths.InitDataPath}
 var InitdDataFilesList = []string{paths.AACfgPath, paths.CDHCfgPath, PolicyPath}
 
 type Config struct {
 	fetchTimeout  int
 	digestPath    string
+	tomlPath      string
 	initdataPath  string
 	parentPath    string
 	writeFiles    []string
@@ -56,6 +59,7 @@ func NewConfig(fetchTimeout int) *Config {
 		parentPath:    ConfigParent,
 		initdataPath:  paths.InitDataPath,
 		digestPath:    DigestPath,
+		tomlPath:      TOMLPath,
 		writeFiles:    WriteFilesList,
 		initdataFiles: InitdDataFilesList,
 	}
@@ -257,7 +261,7 @@ version = "0.1.0"
 	return nil
 }
 
-func extractInitdataAndHash(cfg *Config) error {
+func processInitdata(cfg *Config) error {
 	path := cfg.initdataPath
 	_, err := os.Stat(path)
 	if err != nil {
@@ -267,25 +271,31 @@ func extractInitdataAndHash(cfg *Config) error {
 				return fmt.Errorf("failed to generate dummy initdata: %w", err)
 			}
 		} else {
-			return fmt.Errorf("Error stat initdata file: %w", err)
+			return fmt.Errorf("error stat initdata file: %w", err)
 		}
 	}
 
 	fileReader, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("Error read initdata file: %w", err)
+		return fmt.Errorf("error read initdata file: %w", err)
 	}
 
 	id, err := initdata.Parse(fileReader)
 	if err != nil {
-		return fmt.Errorf("Error parse initdata: %w", err)
+		return fmt.Errorf("error parse initdata: %w", err)
+	}
+
+	// initdata.toml will be consumed by attestation-agent
+	err = writeFile(cfg.tomlPath, []byte(id.TOML))
+	if err != nil {
+		return fmt.Errorf("failed to write file %s: %w", cfg.tomlPath, err)
 	}
 
 	for key, value := range id.Body.Data {
 		path := filepath.Join(cfg.parentPath, key)
 		if isAllowed(path, cfg.initdataFiles) {
 			if err := writeFile(path, []byte(value)); err != nil {
-				return fmt.Errorf("Error write a file in initdata: %w", err)
+				return fmt.Errorf("error write a file in initdata: %w", err)
 			}
 		} else {
 			logger.Printf("File: %s is not allowed in initdata.\n", key)
@@ -324,9 +334,72 @@ func ProvisionFiles(cfg *Config) error {
 		logger.Printf("unsupported user data provider, we extract and calculate initdata hash only.\n")
 	}
 
-	if err := extractInitdataAndHash(cfg); err != nil {
+	if err := processInitdata(cfg); err != nil {
 		return fmt.Errorf("failed to extract initdata hash: %w", err)
 	}
 
 	return nil
+}
+
+func detectCSP(root string) (string, error) {
+	vendor, err := readDMI(root, "sys_vendor")
+	if err != nil {
+		return "", err
+	}
+	product, err := readDMI(root, "product_name")
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case vendor == "Amazon EC2":
+		return "aws", nil
+	case strings.HasPrefix(product, "Google Compute Engine"):
+		return "gcp", nil
+	case vendor == "Alibaba Cloud":
+		return "alibaba", nil
+	case vendor == "Microsoft Corporation" && (product == "Virtual Machine" || strings.HasPrefix(product, "Hyper-V")):
+		return "azure", nil
+	default:
+		return "", nil
+	}
+}
+
+func detectProvisioningSource() (string, error) {
+	csp, err := detectCSP("/")
+	if err != nil {
+		return "", err
+	}
+
+	switch csp {
+	case "aws":
+		return "imds-aws", nil
+	case "azure":
+		return "imds-azure", nil
+	case "gcp":
+		return "imds-gcp", nil
+	case "alibaba":
+		return "imds-alibaba", nil
+	default:
+		return "config-drive", nil
+	}
+}
+
+func readDMI(root, field string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(root, "sys/class/dmi/id", field))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read DMI %s: %w", field, err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func AssertConfigDrive() (bool, error) {
+	source, err := detectProvisioningSource()
+	if err != nil {
+		return false, err
+	}
+
+	return source == "config-drive", nil
 }

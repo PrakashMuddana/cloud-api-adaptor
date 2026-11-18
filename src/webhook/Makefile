@@ -5,7 +5,7 @@ OS          ?= $(shell uname | tr '[:upper:]' '[:lower:]')
 CERT_MANAGER_VERSION ?= $(or $(shell yq '.tools.cert-manager' ../cloud-api-adaptor/versions.yaml 2>/dev/null),v1.15.3)
 
 # Image URL to use all building/pushing image targets
-IMG ?= quay.io/confidential-containers/peer-pods-webhook:latest
+IMG ?= ghcr.io/confidential-containers/peer-pods-webhook:latest
 IMG_REPO ?= $(shell echo '$(IMG)' | cut -d: -f1)
 IMG_TAG ?= $(shell echo '$(IMG)' | cut -d: -f2-)
 WEBHOOK_NAMESPACE ?= peer-pods-webhook-system
@@ -71,7 +71,8 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 	@sed -i 's/namespace: system/namespace: {{ .Values.namespaceOverride | default .Release.Namespace }}/' chart/templates/webhook-config.yaml
 	@sed -i 's/failurePolicy: Fail/failurePolicy: {{ .Values.webhook.failurePolicy }}/' chart/templates/webhook-config.yaml
 	# Add cert-manager CA injection annotation (equivalent to webhookcainjection_patch.yaml)
-	@sed -i '/^metadata:/a\{{- if .Values.certManager.enabled }}\n  annotations:\n    cert-manager.io/inject-ca-from: {{ .Values.namespaceOverride | default .Release.Namespace }}/{{ .Values.namePrefix }}serving-cert\n{{- end }}' chart/templates/webhook-config.yaml
+	# and user-supplied webhook.annotations / webhook.labels
+	@sed -i '/^metadata:/a\{{- if or .Values.certManager.enabled .Values.webhook.annotations }}\n  annotations:\n    {{- if .Values.certManager.enabled }}\n    cert-manager.io/inject-ca-from: {{ .Values.namespaceOverride | default .Release.Namespace }}/{{ .Values.namePrefix }}serving-cert\n    {{- end }}\n    {{- range $$k, $$v := .Values.webhook.annotations }}\n    {{ $$k }}: {{ $$v | quote }}\n    {{- end }}\n{{- end }}\n  {{- with .Values.webhook.labels }}\n  labels:\n    {{- range $$k, $$v := . }}\n    {{ $$k }}: {{ $$v | quote }}\n    {{- end }}\n  {{- end }}' chart/templates/webhook-config.yaml
 	# Add namespaceSelector to exclude webhook namespace and kube-system (equivalent to namespace_selector_patch.yaml)
 	@sed -i '/  name: mwebhook.peerpods.io/a\  namespaceSelector:\n    matchExpressions:\n    - key: kubernetes.io/metadata.name\n      operator: NotIn\n      values:\n      - {{ .Values.namespaceOverride | default .Release.Namespace }}\n      - kube-system' chart/templates/webhook-config.yaml
 	# Add scope to rules (equivalent to inline scope patch in kustomization.yaml)
@@ -101,7 +102,7 @@ test-e2e: ## Run the end-to-end tests on a local kind cluster.
 
 .PHONY: build
 build: generate fmt vet ## Build manager binary.
-	go build -o bin/manager main.go
+	go build -o bin/manager .
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -109,15 +110,15 @@ run: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: test ## Build multi-arch docker image with the manager.
-	docker buildx build --platform $(ARCHES) -t ${IMG} .
+	cd .. && docker buildx build --platform $(ARCHES) -t ${IMG} -f webhook/Dockerfile .
 
 .PHONY: docker-load
 docker-load: ## Load the docker image of current platform only
-	docker buildx build -t ${IMG} --load .
+	cd .. && docker buildx build -t ${IMG} --load -f webhook/Dockerfile .
 
 .PHONY: docker-push
 docker-push: ## Push multi-arch docker image with the manager.
-	docker buildx build --platform $(ARCHES) -t ${IMG} --push .
+	cd .. && docker buildx build --platform $(ARCHES) -t ${IMG} --push -f webhook/Dockerfile .
 
 ##@ Deployment
 

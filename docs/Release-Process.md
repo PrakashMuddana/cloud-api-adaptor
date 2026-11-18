@@ -15,8 +15,7 @@ The flow of releases should roughly be:
    version is picked) and [trustee releases](https://github.com/confidential-containers/trustee/releases).
     - This triggers [kata-containers](https://github.com/kata-containers/kata-containers) to update to these new versions in
       [versions.yaml](https://github.com/kata-containers/kata-containers/blob/main/versions.yaml) under
-      `externals.coco-guest-components.version`, `externals.coco-trustee` and the `image-rs` crate in the agent's
-      [`Cargo.toml`](https://github.com/kata-containers/kata-containers/blob/main/src/agent/Cargo.toml).
+      `externals.coco-guest-components.version` and `externals.coco-trustee`.
     - At this point it makes sense for us to stay in sync, by updating the guest-components and kbs that we use in peer pods,
       by changing the `oci.guest-components.reference` and `git.kbs.tag`values in [versions.yaml](../src/cloud-api-adaptor/versions.yaml).
       We should also bump the kata agent to the latest commit hash by updating `oci.kata-containers.reference` in
@@ -60,9 +59,6 @@ RELEASE_TAG="6d7d2a3fe8243809b3c3a710792c8498292e2fc3"
 ./hack/release-helper.sh caa-image-tag ${RELEASE_TAG}
 ```
 
-At the same time we need to update the value in [Makefile](../src/cloud-providers/Makefile)
-to set the dev commit to `${RELEASE_TAG}-dev`.
-
 In the same PR, bump the Helm chart versions in the
 [peer pods](../src/cloud-api-adaptor/install/charts/peerpods/Chart.yaml),
 [peerpod-ctrl](../src/peerpod-ctrl/chart/Chart.yaml) and
@@ -71,6 +67,8 @@ In the same PR, bump the Helm chart versions in the
 
 - `version`: bump to the new chart release version (e.g. `0.2.0` => `0.3.0`)
 - `appVersion`: set to the CAA release version (e.g. `v0.18.0`)
+
+Then re-run `helm dependency update src/cloud-api-adaptor/install/charts/peerpods/` to update the lockfile.
 
 Include those changes within a new PR to the `main` branch.
 

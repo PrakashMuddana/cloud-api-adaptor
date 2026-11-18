@@ -5,6 +5,7 @@ package byom
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	pv "github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/test/provisioner"
+	kindutils "github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/test/provisioner/common/kind"
 	log "github.com/sirupsen/logrus"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 )
@@ -21,6 +23,7 @@ import (
 // ByomProvisioner implements BYOM e2e provisioning
 type ByomProvisioner struct {
 	provisionerCreatedVMs []string // Track VMs created by this provisioner instance
+	kind                  *kindutils.KindCluster
 }
 
 // ByomInstallChart implements the InstallChart interface
@@ -43,6 +46,8 @@ type ByomProperties struct {
 	CaaImage             string
 	CaaImageTag          string
 	KindConfigFile       string
+	VerifyHostKeys       bool
+	HostKeys             map[string]string
 }
 
 var ByomProps = &ByomProperties{}
@@ -51,6 +56,11 @@ func initByomProperties(properties map[string]string) error {
 	poolSize, err := strconv.Atoi(properties["POOL_SIZE"])
 	if err != nil || poolSize <= 0 {
 		return fmt.Errorf("invalid POOL_SIZE value: %s", properties["POOL_SIZE"])
+	}
+
+	verifyHostKeys := false
+	if val, ok := properties["VERIFY_HOST_KEYS"]; ok {
+		verifyHostKeys = val == "true"
 	}
 
 	ByomProps = &ByomProperties{
@@ -68,6 +78,8 @@ func initByomProperties(properties map[string]string) error {
 		CaaImage:             properties["CAA_IMAGE"],
 		CaaImageTag:          properties["CAA_IMAGE_TAG"],
 		KindConfigFile:       properties["KIND_CONFIG_FILE"],
+		VerifyHostKeys:       verifyHostKeys,
+		HostKeys:             make(map[string]string),
 	}
 
 	// Set defaults
@@ -99,70 +111,21 @@ func NewByomProvisioner(properties map[string]string) (pv.CloudProvisioner, erro
 		os.Setenv("DOCKER_HOST", ByomProps.DockerHost)
 	}
 
-	return &ByomProvisioner{}, nil
+	kind, err := kindutils.NewKindCluster(map[string]string{
+		"CLUSTER_NAME":      ByomProps.ClusterName,
+		"CONTAINER_RUNTIME": ByomProps.ContainerRuntime,
+		"KIND_CONFIG_FILE":  ByomProps.KindConfigFile,
+		"WORKER_NODE_NAME":  ByomProps.WorkerNodeName,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &ByomProvisioner{kind: kind}, nil
 }
 
 func (b *ByomProvisioner) CreateCluster(ctx context.Context, cfg *envconf.Config) error {
-	kindConfigPath, err := filepath.Abs(ByomProps.KindConfigFile)
-	if err != nil {
-		return fmt.Errorf("error getting absolute path of kind config file: %w", err)
-	}
-
-	log.Infof("Using BYOM kind config from: %s", kindConfigPath)
-	os.Setenv("KIND_CONFIG_FILE", kindConfigPath)
-
-	workingDir := filepath.Dir(kindConfigPath)
-
-	if err := b.createKindCluster(workingDir); err != nil {
-		log.Errorf("Error creating Kind cluster: %v", err)
-		return err
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get user home directory: %w", err)
-	}
-	cfg.WithKubeconfigFile(filepath.Join(home, ".kube/config"))
-
-	if err := pv.AddNodeRoleWorkerLabel(context.Background(), ByomProps.ClusterName, cfg); err != nil {
-
-		return fmt.Errorf("failed to label nodes: %w", err)
-	}
-
-	// Update containerd configuration to not discard unpacked layers
-	log.Info("Configuring containerd on worker node to keep unpacked layers...")
-
-	cmd := exec.Command("docker", "exec", ByomProps.WorkerNodeName, "sed", "-i",
-		"s/discard_unpacked_layers = true/discard_unpacked_layers = false/g",
-		"/etc/containerd/config.toml")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Warnf("Failed to update containerd config: %v, output: %s", err, string(output))
-	} else {
-		log.Info("Updated containerd config to keep unpacked layers")
-
-		// Restart containerd to apply the change
-		cmd = exec.Command("docker", "exec", ByomProps.WorkerNodeName, "systemctl", "restart", "containerd")
-		output, err = cmd.CombinedOutput()
-		if err != nil {
-			log.Warnf("Failed to restart containerd: %v, output: %s", err, string(output))
-		} else {
-			log.Info("Restarted containerd, waiting for it to be ready...")
-			time.Sleep(5 * time.Second)
-
-			// Verify if containerd is running
-			cmd = exec.Command("docker", "exec", ByomProps.WorkerNodeName, "systemctl", "is-active", "containerd")
-			output, err = cmd.CombinedOutput()
-			status := strings.TrimSpace(string(output))
-			if err != nil || status != "active" {
-				log.Warnf("Containerd may not be running properly: status=%s, err=%v", status, err)
-			} else {
-				log.Info("Containerd is active and running")
-			}
-		}
-	}
-
-	return nil
+	return b.kind.CreateCluster(ctx, cfg)
 }
 
 // CreatePodVMInstance creates new containers from the uploaded image and use their IPs for the pool.
@@ -189,6 +152,17 @@ func (b *ByomProvisioner) CreatePodVMInstance(ctx context.Context, cfg *envconf.
 
 		poolIPs = append(poolIPs, ip)
 		log.Infof("Created container %d/%d: %s with IP: %s", i+1, ByomProps.PoolSize, containerName, ip)
+		if ByomProps.VerifyHostKeys {
+			hostKeys, err := b.getContainerHostKeys(containerName)
+			if err != nil {
+				return fmt.Errorf("failed to get host keys for container %s: %w", containerName, err)
+			}
+			for keyType, keyContent := range hostKeys {
+				keyFilename := fmt.Sprintf("%s_%s.pub", containerName, keyType)
+				ByomProps.HostKeys[keyFilename] = keyContent
+				log.Infof("Captured %s host key for container %s", keyType, containerName)
+			}
+		}
 	}
 
 	ByomProps.VMPoolIPs = strings.Join(poolIPs, ",")
@@ -203,12 +177,7 @@ func (b *ByomProvisioner) CreateVPC(ctx context.Context, cfg *envconf.Config) er
 }
 
 func (b *ByomProvisioner) DeleteCluster(ctx context.Context, cfg *envconf.Config) error {
-	kindConfigPath, err := filepath.Abs(ByomProps.KindConfigFile)
-	if err != nil {
-		return fmt.Errorf("error getting absolute path of kind config file: %w", err)
-	}
-
-	return b.deleteKindCluster(filepath.Dir(kindConfigPath))
+	return b.kind.DeleteCluster(ctx, cfg)
 }
 
 func (b *ByomProvisioner) DeleteVPC(ctx context.Context, cfg *envconf.Config) error {
@@ -286,25 +255,7 @@ func (b *ByomInstallChart) Install(ctx context.Context, cfg *envconf.Config) err
 		return fmt.Errorf("failed to create SSH key secret: %w", err)
 	}
 
-	if err := b.Helm.Install(ctx, cfg); err != nil {
-		return err
-	}
-
-	// Wait for the worker node and heck for kata-runtime label
-	log.Info("Waiting for worker node to be labeled with kata-runtime...")
-	timeout := time.Now().Add(3 * time.Minute)
-	for time.Now().Before(timeout) {
-		checkLabel := exec.Command("kubectl", "get", "node", ByomProps.WorkerNodeName, "--show-labels")
-		checkLabel.Env = append(os.Environ(), "KUBECONFIG="+cfg.KubeconfigFile())
-		out, err := checkLabel.Output()
-		if err == nil && strings.Contains(string(out), "katacontainers.io/kata-runtime=true") {
-			log.Info("Worker node is labeled with kata-runtime and ready!")
-			return nil
-		}
-		time.Sleep(15 * time.Second)
-	}
-
-	return fmt.Errorf("kata-runtime label not found - node may not be ready for deployment")
+	return b.Helm.Install(ctx, cfg)
 }
 
 func (b *ByomInstallChart) createSSHKeySecret(ctx context.Context, cfg *envconf.Config) error {
@@ -320,19 +271,28 @@ func (b *ByomInstallChart) createSSHKeySecret(ctx context.Context, cfg *envconf.
 	secretName := "ssh-key-secret"
 	log.Infof("Creating SSH key secret from %s and %s", ByomProps.SSHSecretPrivKeyPath, ByomProps.SSHSecretPubKeyPath)
 
-	// Create the secret using kubectl
+	// Create or replace the secret using kubectl
 	args := []string{
 		"create", "secret", "generic", secretName,
 		"--from-file=id_rsa=" + ByomProps.SSHSecretPrivKeyPath,
 		"--from-file=id_rsa.pub=" + ByomProps.SSHSecretPubKeyPath,
 		"-n", b.Helm.Namespace,
+		"--dry-run=client", "-o", "yaml",
 	}
 	cmd := exec.Command("kubectl", args...)
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+cfg.KubeconfigFile())
-	stdoutStderr, err := cmd.CombinedOutput()
-	log.Tracef("%v, output: %s", cmd, stdoutStderr)
+	yamlOutput, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to create ssh-key-secret: %w, output: %s", err, string(stdoutStderr))
+		return fmt.Errorf("failed to generate ssh-key-secret yaml: %w, output: %s", err, string(yamlOutput))
+	}
+
+	applyCmd := exec.Command("kubectl", "apply", "-f", "-")
+	applyCmd.Env = append(os.Environ(), "KUBECONFIG="+cfg.KubeconfigFile())
+	applyCmd.Stdin = strings.NewReader(string(yamlOutput))
+	stdoutStderr, err := applyCmd.CombinedOutput()
+	log.Tracef("%v, output: %s", applyCmd, stdoutStderr)
+	if err != nil {
+		return fmt.Errorf("failed to apply ssh-key-secret: %w, output: %s", err, string(stdoutStderr))
 	}
 	log.Infof("Created ssh-key-secret from SSH key files")
 	return nil
@@ -366,6 +326,16 @@ func (b *ByomInstallChart) Configure(ctx context.Context, cfg *envconf.Config, p
 		if properties[k] != "" {
 			b.Helm.OverrideProviderValues[v] = properties[k]
 		}
+	}
+
+	// If host keys are collected/enabled, pass them as providerSecrets.byom.hostKeys using JSON override
+	// to properly support filenames with dots (e.g. "vm1.pub")
+	if ByomProps.VerifyHostKeys && len(ByomProps.HostKeys) > 0 {
+		hostKeysJSON, err := json.Marshal(ByomProps.HostKeys)
+		if err != nil {
+			return fmt.Errorf("failed to marshal hostKeys to JSON: %w", err)
+		}
+		b.Helm.OverrideValueMap["providerSecrets.byom.hostKeys"] = string(hostKeysJSON)
 	}
 
 	return nil
@@ -462,6 +432,37 @@ func (b *ByomProvisioner) getContainerIPAddress(containerName string) (string, e
 	return "", fmt.Errorf("timeout waiting for container %s to get IP address", containerName)
 }
 
+func (b *ByomProvisioner) getContainerHostKeys(containerName string) (map[string]string, error) {
+	log.Infof("Getting SSH host keys for container %s", containerName)
+
+	hostKeys := make(map[string]string)
+	// In BYOM podvm container images, host keys are in /etc/ssh/
+	keyTypes := map[string]string{
+		"ed25519": "ssh_host_ed25519_key.pub",
+		"ecdsa":   "ssh_host_ecdsa_key.pub",
+		"rsa":     "ssh_host_rsa_key.pub",
+	}
+	for keyType, keyFile := range keyTypes {
+		cmd := exec.Command("docker", "exec", containerName, "cat", fmt.Sprintf("/etc/ssh/%s", keyFile))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Warnf("Failed to read %s from container %s: %v", keyFile, containerName, err)
+			continue
+		}
+		keyContent := strings.TrimSpace(string(output))
+		if keyContent != "" {
+			log.Infof("Retrieved %s for container %s", keyFile, containerName)
+			hostKeys[keyType] = keyContent
+		}
+	}
+
+	if len(hostKeys) == 0 {
+		return nil, fmt.Errorf("no SSH host keys found in container %s", containerName)
+	}
+
+	return hostKeys, nil
+}
+
 func (b *ByomProvisioner) destroyContainer(containerName string) error {
 	log.Infof("Destroying container %s", containerName)
 
@@ -470,43 +471,9 @@ func (b *ByomProvisioner) destroyContainer(containerName string) error {
 	}
 
 	if err := exec.Command("docker", "rm", "-f", containerName).Run(); err != nil {
-		return fmt.Errorf("Failed to remove container %s: %v", containerName, err)
+		return fmt.Errorf("failed to remove container %s: %v", containerName, err)
 	}
 
 	log.Infof("Container %s destroyed successfully", containerName)
-	return nil
-}
-
-func (b *ByomProvisioner) createKindCluster(workingDir string) error {
-	// Create kind cluster by executing the script on the node
-	cmd := exec.Command("/bin/bash", "-c", "./kind_cluster.sh create")
-	cmd.Dir = workingDir
-	cmd.Stdout = os.Stdout
-	// TODO: better handle stderr. Messages getting out of order.
-	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
-	// Set CLUSTER_NAME and CONTAINER_RUNTIME if available. Also unset KUBECONFIG so that the default path is used.
-	cmd.Env = append(cmd.Env, "CLUSTER_NAME="+ByomProps.ClusterName, "KUBECONFIG=", "CONTAINER_RUNTIME="+ByomProps.ContainerRuntime)
-	err := cmd.Run()
-	if err != nil {
-		log.Errorf("Error creating Kind cluster: %v", err)
-		return err
-	}
-
-	return nil
-}
-
-func (b *ByomProvisioner) deleteKindCluster(workingDir string) error {
-	// Delete kind cluster by executing the script on the node
-	cmd := exec.Command("/bin/bash", "-c", "./kind_cluster.sh delete")
-	cmd.Dir = workingDir
-	cmd.Stdout = os.Stdout
-	// TODO: better handle stderr. Messages getting out of order.
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		log.Errorf("Error deleting Kind cluster: %v", err)
-		return err
-	}
 	return nil
 }

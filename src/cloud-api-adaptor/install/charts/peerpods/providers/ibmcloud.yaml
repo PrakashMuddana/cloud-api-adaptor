@@ -26,10 +26,6 @@ providerConfigs:
     # (default: "true")
     # DISABLECVM: "true"
 
-    # Enable encrypted scratch space for pod VMs
-    # (default: "false")
-    # ENABLE_SCRATCH_SPACE: "false"
-
     # [EXPERIMENTAL] Enable external networking via pod VM
     # (default: "false")
     # EXTERNAL_NETWORK_VIA_PODVM: "false"
@@ -78,6 +74,10 @@ providerConfigs:
     # (default: "")
     # IBMCLOUD_SSH_KEY_ID: ""
 
+    # Time to wait for a persistent volume to detach from the previous Pod VM and attach to the new one
+    # (default: "")
+    # IBMCLOUD_VOLUME_ATTACH_TIMEOUT: ""
+
     # IBM Cloud VPC Service URL
     # (default: "")
     # IBMCLOUD_VPC_ENDPOINT: ""
@@ -110,6 +110,10 @@ providerConfigs:
     # (default: "")
     # PODS_DIR: ""
 
+    # Enable developer mode for disabling Peer Pod VM auto delete
+    # (default: "false")
+    # PODVM_DEVELOPER_MODE: "false"
+
     # [EXPERIMENTAL] Comma separated CIDRs for local pod subnets
     # (default: "")
     # POD_SUBNET_CIDRS: ""
@@ -125,6 +129,14 @@ providerConfigs:
     # List of tags to attach to the Pod VMs, comma separated
     # (default: "")
     # TAGS: ""
+
+    # Comma-separated IANA TLS cipher suite names for peer pod connections (not applicable for VersionTLS13)
+    # (default: "")
+    # TLS_CIPHER_SUITES: ""
+
+    # Minimum TLS version for peer pod connections (VersionTLS12 or VersionTLS13)
+    # (default: "")
+    # TLS_MIN_VERSION: ""
 
     # Skip TLS certificate verification - use it only for testing
     # (default: "false")

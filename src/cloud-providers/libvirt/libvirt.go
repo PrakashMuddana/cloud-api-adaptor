@@ -23,14 +23,29 @@ import (
 const (
 	// architecture value for the s390x architecture
 	archS390x = "s390x"
-	// architecutre value for aarch64/arm64
+	// architecture value for aarch64/arm64
 	archAArch64 = "aarch64"
+	// architecture value for x86_64
+	archX86_64 = "x86_64"
 	// hvm indicates that the OS is one designed to run on bare metal, so requires full virtualization.
 	typeHardwareVirtualMachine = "hvm"
 	// The amount of retries to get the domain IP addresses
 	GetDomainIPsRetries = 20
 	// The sleep time between retries to get the domain IP addresses
 	GetDomainIPsSleep = time.Second * 3
+
+	// cpuModeHostModel asks libvirt to select the closest named CPU model that
+	// the host supports and expose its full feature set to the guest.
+	cpuModeHostModel = "host-model"
+
+	// cpuModeHostPassthrough exposes the exact host CPU to the guest with no
+	// model abstraction.
+	cpuModeHostPassthrough = "host-passthrough"
+
+	// csiDataDiskSerialPrefix tags CSI data disks in the domain XML.
+	// Each disk gets a unique serial (caa-csi-0, caa-csi-1, ...) so the
+	// guest can identify them via /dev/disk/by-id/virtio-caa-csi-<N>.
+	csiDataDiskSerialPrefix = "caa-csi-"
 )
 
 // validateCPUSet validates the CPUSet format.
@@ -57,6 +72,7 @@ type domainConfig struct {
 	networkName string
 	bootDisk    string
 	cidataDisk  string
+	dataDisks   []string
 }
 
 // createCloudInitISO creates an ISO file with a userdata and a metadata file. The ISO image will be created in-memory since it is small
@@ -69,23 +85,7 @@ func createCloudInitISO(v *vmConfig) ([]byte, error) {
 	return createCloudInit([]byte(userData), []byte(metaData))
 }
 
-func checkDomainExistsByName(name string, libvirtClient *libvirtClient) (exist bool, err error) {
-
-	logger.Printf("Checking if instance (%s) exists", name)
-	domain, err := libvirtClient.connection.LookupDomainByName(name)
-	if err != nil {
-		if err.(libvirt.Error).Code == libvirt.ERR_NO_DOMAIN {
-			return false, nil
-		}
-		return false, err
-	}
-	defer freeDomain(domain, &err)
-
-	return true, nil
-
-}
-
-func uploadIso(isoData []byte, isoVolName string, libvirtClient *libvirtClient) (string, error) {
+func uploadIso(ctx context.Context, isoData []byte, isoVolName string, libvirtClient *libvirtClient) (string, error) {
 
 	logger.Printf("Uploading iso file: %s\n", isoVolName)
 	volumeDef := newDefVolume(isoVolName)
@@ -104,7 +104,7 @@ func uploadIso(isoData []byte, isoVolName string, libvirtClient *libvirtClient) 
 	volumeDef.Capacity.Value = size
 	volumeDef.Target.Format.Type = "raw"
 
-	return uploadVolume(libvirtClient, volumeDef, img)
+	return uploadVolume(ctx, libvirtClient, volumeDef, img)
 
 }
 
@@ -130,20 +130,6 @@ func getHostCapabilities(conn *libvirt.Connect) (*libvirtxml.Caps, error) {
 		return nil, fmt.Errorf("unable to unmarshal capabilities, cause: %w", err)
 	}
 
-	return caps, nil
-}
-
-func GetDomainCapabilities(conn *libvirt.Connect, emulatorbin string, arch string, machine string, virttype string, flags libvirt.ConnectGetDomainCapabilitiesFlags) (*libvirtxml.DomainCaps, error) {
-	capsXML, err := conn.GetDomainCapabilities(emulatorbin, arch, machine, virttype, flags)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get domain capabilities, cause: %w", err)
-	}
-	caps := &libvirtxml.DomainCaps{}
-	err = xml.Unmarshal([]byte(capsXML), caps)
-	if err != nil {
-		return nil, fmt.Errorf("unable to unmarshal domain capabilities, cause: %w", err)
-
-	}
 	return caps, nil
 }
 
@@ -181,6 +167,36 @@ func getCanonicalMachineName(caps *libvirtxml.Caps, arch string, virttype string
 	}
 
 	return "", fmt.Errorf("cannot find machine type %s for %s/%s in %v", targetmachine, virttype, arch, caps)
+}
+
+// dataDisksToVirtio builds virtio disk elements for CSI data volumes.
+// startDev is the first device letter to use (e.g. 'c' produces vdc, vdd, ...).
+// When enableIOMMU is true the driver sets iommu=on, matching other virtio
+// devices on s390x/aarch64.
+func dataDisksToVirtio(paths []string, startDev byte, enableIOMMU bool) []libvirtxml.DomainDisk {
+	maxDisks := int('z') - int(startDev) + 1
+	if len(paths) > maxDisks {
+		logger.Printf("WARNING: %d CSI data disks requested but only %d virtio slots available (vd%c-vdz), capping", len(paths), maxDisks, startDev)
+		paths = paths[:maxDisks]
+	}
+	var disks []libvirtxml.DomainDisk
+	for i, path := range paths {
+		dev := fmt.Sprintf("vd%c", startDev+byte(i))
+		driver := &libvirtxml.DomainDiskDriver{Name: "qemu", Type: "raw"}
+		if enableIOMMU {
+			driver.IOMMU = "on"
+		}
+		disks = append(disks, libvirtxml.DomainDisk{
+			Device: "disk",
+			Driver: driver,
+			Source: &libvirtxml.DomainDiskSource{
+				File: &libvirtxml.DomainDiskSourceFile{File: path},
+			},
+			Target: &libvirtxml.DomainDiskTarget{Dev: dev, Bus: "virtio"},
+			Serial: fmt.Sprintf("%s%d", csiDataDiskSerialPrefix, i),
+		})
+	}
+	return disks
 }
 
 func createDomainXMLs390x(client *libvirtClient, cfg *domainConfig, vm *vmConfig) (*libvirtxml.Domain, error) {
@@ -234,7 +250,7 @@ func createDomainXMLs390x(client *libvirtClient, cfg *domainConfig, vm *vmConfig
 		},
 	}
 
-	return &libvirtxml.Domain{
+	domain := &libvirtxml.Domain{
 		Type:        "kvm",
 		Name:        cfg.name,
 		Description: "This Virtual Machine is the peer-pod VM",
@@ -256,6 +272,7 @@ func createDomainXMLs390x(client *libvirtClient, cfg *domainConfig, vm *vmConfig
 			Value:  cfg.cpu,
 			CPUSet: vm.cpuset,
 		},
+		CPU: &libvirtxml.DomainCPU{Mode: cpuModeHostModel},
 		Clock: &libvirtxml.DomainClock{
 			Offset: "utc",
 		},
@@ -266,7 +283,10 @@ func createDomainXMLs390x(client *libvirtClient, cfg *domainConfig, vm *vmConfig
 			},
 			Emulator: guest.Arch.Emulator,
 			MemBalloon: &libvirtxml.DomainMemBalloon{
-				Model: "none",
+				Model: "virtio",
+				Driver: &libvirtxml.DomainMemBalloonDriver{
+					IOMMU: "on",
+				},
 			},
 			RNGs: []libvirtxml.DomainRNG{
 				{
@@ -302,7 +322,22 @@ func createDomainXMLs390x(client *libvirtClient, cfg *domainConfig, vm *vmConfig
 				},
 			},
 		},
-	}, nil
+	}
+
+	// s390x: boot=vda, cidata=vdb — data disks start at vdc
+	domain.Devices.Disks = append(domain.Devices.Disks, dataDisksToVirtio(cfg.dataDisks, 'c', true)...)
+
+	switch vm.launchSecurityType {
+	case S390PV:
+		domain.LaunchSecurity = &libvirtxml.DomainLaunchSecurity{
+			S390PV: &libvirtxml.DomainLaunchSecurityS390PV{},
+		}
+		return domain, nil
+	case NoLaunchSecurity:
+		return domain, nil
+	default:
+		return nil, fmt.Errorf("launch security type %s is not supported for s390x", vm.launchSecurityType)
+	}
 }
 
 func createDomainXMLx86_64(client *libvirtClient, cfg *domainConfig, vm *vmConfig) (*libvirtxml.Domain, error) {
@@ -315,7 +350,7 @@ func createDomainXMLx86_64(client *libvirtClient, cfg *domainConfig, vm *vmConfi
 		Memory:      &libvirtxml.DomainMemory{Value: cfg.mem, Unit: "MiB", DumpCore: "on"},
 		VCPU:        &libvirtxml.DomainVCPU{Value: cfg.cpu, CPUSet: vm.cpuset},
 		OS: &libvirtxml.DomainOS{
-			Type: &libvirtxml.DomainOSType{Arch: "x86_64", Type: typeHardwareVirtualMachine},
+			Type: &libvirtxml.DomainOSType{Arch: archX86_64, Type: typeHardwareVirtualMachine},
 		},
 		// For Hot-Plug Feature.
 		Features: &libvirtxml.DomainFeatureList{
@@ -323,7 +358,7 @@ func createDomainXMLx86_64(client *libvirtClient, cfg *domainConfig, vm *vmConfi
 			APIC:   &libvirtxml.DomainFeatureAPIC{},
 			VMPort: &libvirtxml.DomainFeatureState{State: "off"},
 		},
-		CPU:      &libvirtxml.DomainCPU{Mode: "host-model"},
+		CPU:      &libvirtxml.DomainCPU{Mode: cpuModeHostModel},
 		OnReboot: "restart",
 		Devices: &libvirtxml.DomainDeviceList{
 			// Disks.
@@ -387,6 +422,9 @@ func createDomainXMLx86_64(client *libvirtClient, cfg *domainConfig, vm *vmConfi
 		domain.Devices.Disks[cidataDiskIndex].Target.Dev = "sdb"
 		domain.Devices.Disks[cidataDiskIndex].Address.Drive.Unit = &cidataDiskAddr
 	}
+
+	// x86_64: boot=sda (sata), cidata=hda/sdb (ide/sata) — no virtio conflict
+	domain.Devices.Disks = append(domain.Devices.Disks, dataDisksToVirtio(cfg.dataDisks, 'b', false)...)
 
 	switch l := vm.launchSecurityType; l {
 	case NoLaunchSecurity:
@@ -464,7 +502,7 @@ func createDomainXMLaarch64(client *libvirtClient, cfg *domainConfig, vm *vmConf
 		},
 		Memory: &libvirtxml.DomainMemory{Value: cfg.mem, Unit: "MiB"},
 		VCPU:   &libvirtxml.DomainVCPU{Value: cfg.cpu, CPUSet: vm.cpuset},
-		CPU:    &libvirtxml.DomainCPU{Mode: "host-passthrough"},
+		CPU:    &libvirtxml.DomainCPU{Mode: cpuModeHostPassthrough},
 		Devices: &libvirtxml.DomainDeviceList{
 			Disks: []libvirtxml.DomainDisk{
 				bootDisk,
@@ -503,6 +541,8 @@ func createDomainXMLaarch64(client *libvirtClient, cfg *domainConfig, vm *vmConf
 		},
 	}
 
+	// aarch64: boot=vda (virtio), cidata=sda (scsi) — data disks start at vdb
+	domain.Devices.Disks = append(domain.Devices.Disks, dataDisksToVirtio(cfg.dataDisks, 'b', true)...)
 	return domain, nil
 }
 
@@ -529,14 +569,14 @@ func getDomainIPs(dom *libvirt.Domain) ([]netip.Addr, error) {
 	domIfList, err := dom.ListAllInterfaceAddresses(libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE)
 	if err != nil {
 		domName, _ := dom.GetName()
-		return nil, fmt.Errorf("Failed to get domain %s interfaces: %s", domName, err)
+		return nil, fmt.Errorf("failed to get domain %s interfaces: %s", domName, err)
 	}
 
 	for _, domIf := range domIfList {
 		for _, addr := range domIf.Addrs {
 			parsedAddr, err := netip.ParseAddr(addr.Addr)
 			if err != nil {
-				return nil, fmt.Errorf("Failed to parse address: %s", err)
+				return nil, fmt.Errorf("failed to parse address: %s", err)
 			}
 			ips = append(ips, parsedAddr)
 		}
@@ -545,26 +585,93 @@ func getDomainIPs(dom *libvirt.Domain) ([]netip.Addr, error) {
 	return ips, nil
 }
 
+// waitForDomainIPs polls getIPs until at least one IP is returned, retries are
+// exhausted, or ctx is cancelled. Uses FixedDelay so the interval between
+// retries is constant.
+func waitForDomainIPs(ctx context.Context, getIPs func() ([]netip.Addr, error), retries uint, sleep time.Duration) ([]netip.Addr, error) {
+	var ips []netip.Addr
+	err := retry.Do(
+		func() error {
+			var err error
+			ips, err = getIPs()
+			if err != nil {
+				// Something went completely wrong so it should return immediately
+				return retry.Unrecoverable(fmt.Errorf("internal error on getting domain IPs: %w", err))
+			}
+
+			if len(ips) > 0 {
+				return nil
+			}
+			return errors.New("domain has no IPs assigned yet")
+		},
+		retry.Context(ctx),
+		retry.Attempts(retries),
+		retry.Delay(sleep),
+		retry.DelayType(retry.FixedDelay),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return ips, nil
+}
+
+// normalizeRootDiskSize returns size if non-zero, otherwise defaultRootDiskSize.
+// Extracted so the defaulting logic can be unit-tested without a live libvirt
+// connection.
+func normalizeRootDiskSize(size uint64) uint64 {
+	if size == 0 {
+		return defaultRootDiskSize
+	}
+	return size
+}
+
 func CreateDomain(ctx context.Context, libvirtClient *libvirtClient, v *vmConfig) (result *createDomainOutput, err error) {
 
-	v.rootDiskSize = uint64(10)
+	v.rootDiskSize = normalizeRootDiskSize(v.rootDiskSize)
 
-	exists, err := checkDomainExistsByName(v.name, libvirtClient)
-	if err != nil {
-		return nil, fmt.Errorf("Error in checking instance: %s", err)
+	logger.Printf("Checking if instance (%s) exists", v.name)
+	domain, err := libvirtClient.connection.LookupDomainByName(v.name)
+	if err == nil {
+		// Domain already exists. Populate instanceID and ips so the caller
+		// has a valid UUID for cleanup if anything goes wrong subsequently.
+		defer freeDomain(domain, &err)
+		uuid, uuidErr := domain.GetUUIDString()
+		if uuidErr != nil {
+			return nil, fmt.Errorf("existing domain UUID retrieval failed: %w", uuidErr)
+		}
+		v.instanceID = uuid
+		// Use the same retry loop as the create path: a lease may not be
+		// visible yet even though the domain is running.
+		ips, ipsErr := waitForDomainIPs(ctx, func() ([]netip.Addr, error) {
+			return getDomainIPs(domain)
+		}, GetDomainIPsRetries, GetDomainIPsSleep)
+		if ipsErr != nil {
+			// Return the instance so the caller can clean up via DeleteInstance.
+			logger.Printf("existing domain IP addresses not found (uuid=%s): %v", uuid, ipsErr)
+			return &createDomainOutput{instance: v}, fmt.Errorf("existing domain (uuid=%s) IP addresses not found: %w", uuid, ipsErr)
+		}
+		v.ips = ips
+		logger.Printf("Instance already exists (uuid=%s)", uuid)
+		return &createDomainOutput{instance: v}, nil
 	}
-	if exists {
-		logger.Printf("Instance already exists ")
-		return &createDomainOutput{
-			instance: v,
-		}, nil
+	var libvirtErr libvirt.Error
+	if !errors.As(err, &libvirtErr) || libvirtErr.Code != libvirt.ERR_NO_DOMAIN {
+		return nil, fmt.Errorf("error checking instance: %w", err)
 	}
 
 	rootVolName := v.name + "-root.qcow2"
-	err = createVolume(rootVolName, v.rootDiskSize, libvirtClient.volName, libvirtClient)
+	err = createVolume(ctx, rootVolName, v.rootDiskSize, v.volName, libvirtClient)
 	if err != nil {
-		return nil, fmt.Errorf("Error in creating volume: %s", err)
+		return nil, fmt.Errorf("error in creating volume: %s", err)
 	}
+	domainOwnsVolumes := false
+	defer func() {
+		if !domainOwnsVolumes {
+			if delErr := deleteVolume(ctx, libvirtClient, rootVolName); delErr != nil {
+				logger.Printf("Warning: failed to clean up root volume %s: %v", rootVolName, delErr)
+			}
+		}
+	}()
 
 	cloudInitIso, err := createCloudInitISO(v)
 	if err != nil {
@@ -572,19 +679,30 @@ func CreateDomain(ctx context.Context, libvirtClient *libvirtClient, v *vmConfig
 	}
 
 	isoVolName := v.name + "-cloudinit.iso"
-	isoVolFile, err := uploadIso(cloudInitIso, isoVolName, libvirtClient)
+	isoVolFile, err := uploadIso(ctx, cloudInitIso, isoVolName, libvirtClient)
 	if err != nil {
-		return nil, fmt.Errorf("Error in uploading iso volume: %s", err)
+		return nil, fmt.Errorf("error in uploading iso volume: %s", err)
 	}
+	defer func() {
+		if !domainOwnsVolumes {
+			if delErr := deleteVolume(ctx, libvirtClient, isoVolName); delErr != nil {
+				logger.Printf("Warning: failed to clean up ISO volume %s: %v", isoVolName, delErr)
+			}
+		}
+	}()
 
 	rootVol, err := getVolume(libvirtClient, rootVolName)
 	if err != nil {
-		return nil, fmt.Errorf("Error retrieving volume: %s", err)
+		return nil, fmt.Errorf("error retrieving volume: %s", err)
 	}
 
 	rootVolFile, err := rootVol.GetPath()
+	freeErr := rootVol.Free()
+	if freeErr != nil {
+		logger.Printf("Warning: failed to free root volume handle: %v", freeErr)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("Error retrieving volume path: %s", err)
+		return nil, fmt.Errorf("error retrieving volume path: %s", err)
 	}
 
 	domainCfg := domainConfig{
@@ -594,6 +712,7 @@ func CreateDomain(ctx context.Context, libvirtClient *libvirtClient, v *vmConfig
 		networkName: libvirtClient.networkName,
 		bootDisk:    rootVolFile,
 		cidataDisk:  isoVolFile,
+		dataDisks:   v.dataDisks,
 	}
 
 	domCfg, err := createDomainXML(libvirtClient, &domainCfg, v)
@@ -604,66 +723,53 @@ func CreateDomain(ctx context.Context, libvirtClient *libvirtClient, v *vmConfig
 	logger.Printf("Create XML for '%s'", v.name)
 	domXML, err := domCfg.Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create domain xml: %s", err)
+		return nil, fmt.Errorf("failed to create domain xml: %s", err)
 	}
 
 	logger.Printf("Creating VM '%s'", v.name)
 	dom, err := libvirtClient.connection.DomainDefineXML(domXML)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to define domain: %s", err)
+		return nil, fmt.Errorf("failed to define domain: %s", err)
 	}
+	defer func() {
+		if freeErr := dom.Free(); freeErr != nil {
+			logger.Printf("Warning: failed to free domain handle: %v", freeErr)
+		}
+	}()
+
+	// Capture UUID before Create() so instanceID is available for cleanup even
+	// if the domain starts but immediately crashes (e.g. corrupt backing image).
+	uuid, err := dom.GetUUIDString()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get domain UUID: %s", err)
+	}
+	v.instanceID = uuid
+	logger.Printf("VM defined: name=%s, uuid=%s", v.name, uuid)
 
 	// Start Domain.
 	logger.Printf("Starting VM '%s'", v.name)
-	err = dom.Create()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to start VM: %s", err)
+	if err = dom.Create(); err != nil {
+		domainOwnsVolumes = true
+		return &createDomainOutput{instance: v}, fmt.Errorf("failed to start VM: %s", err)
 	}
 
-	// Get the domain UUID which persists across all domain states
-	uuid, err := dom.GetUUIDString()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to get domain UUID: %s", err)
-	}
-
-	// For libvirt, store the domain UUID as instanceID.
-	// UUIDs persist across all domain states (running, paused, shut off),
-	// allowing cleanup to work reliably even for crashed domains.
-	v.instanceID = uuid
-	logger.Printf("VM created: name=%s, uuid=%s", v.name, uuid)
+	logger.Printf("VM started: name=%s, uuid=%s", v.name, uuid)
 
 	// Wait for sometime for the IP to be visible
-	if err := retry.Do(
-		func() error {
-			ips, err := getDomainIPs(dom)
-			if err != nil {
-				// Something went completely wrong so it should return immediately
-				return retry.Unrecoverable(fmt.Errorf("Internal error on getting domain IPs: %s", err))
-			}
-
-			if len(ips) > 0 {
-				return nil
-			}
-			return fmt.Errorf("Domain has not IPs assigned yet")
-		},
-		retry.Attempts(GetDomainIPsRetries),
-		retry.Delay(GetDomainIPsSleep),
-	); err != nil {
-		logger.Printf("Unable to get IP addresses after %d retries (sleep time=%ds): %s",
+	ips, err := waitForDomainIPs(ctx, func() ([]netip.Addr, error) {
+		return getDomainIPs(dom)
+	}, GetDomainIPsRetries, GetDomainIPsSleep)
+	if err != nil {
+		logger.Printf("Unable to get IP addresses after %d retries (sleep time=%v): %s",
 			GetDomainIPsRetries, GetDomainIPsSleep, err)
-		// Returning the instance with UUID allows the caller to clean it up properly.
+		domainOwnsVolumes = true
 		return &createDomainOutput{
 			instance: v,
-		}, fmt.Errorf("Domain (uuid=%s) IP addresses not found", uuid)
+		}, fmt.Errorf("domain (uuid=%s) IP addresses not found: %w", uuid, err)
 	}
 
-	if v.ips, err = getDomainIPs(dom); err != nil {
-		// Return the instance even on error so cleanup can happen
-		return &createDomainOutput{
-			instance: v,
-		}, fmt.Errorf("Internal error on getting domain IPs: %s", err)
-	}
-
+	v.ips = ips
+	domainOwnsVolumes = true
 	logger.Printf("Instance created successfully")
 	return &createDomainOutput{
 		instance: v,
@@ -711,7 +817,7 @@ func DeleteDomain(ctx context.Context, libvirtClient *libvirtClient, domainUUID 
 		} else {
 			logger.Printf("domainDef %v", domainDef.Devices.Disks)
 			for _, diskPath := range getDeletableDiskPaths(&domainDef) {
-				err = deleteVolumeByPath(libvirtClient, diskPath)
+				err = deleteVolumeByPath(ctx, libvirtClient, diskPath)
 				if err != nil {
 					logger.Printf("Deleting volume (%s) returned error: %s", diskPath, err)
 					cleanupErrs = append(cleanupErrs, fmt.Sprintf("delete volume %s: %v", diskPath, err))
@@ -722,7 +828,9 @@ func DeleteDomain(ctx context.Context, libvirtClient *libvirtClient, domainUUID 
 
 	// Undefine the domain
 	if err := domain.UndefineFlags(libvirt.DOMAIN_UNDEFINE_NVRAM); err != nil {
-		if e := err.(libvirt.Error); e.Code == libvirt.ERR_NO_SUPPORT || e.Code == libvirt.ERR_INVALID_ARG {
+		var libvirtErr libvirt.Error
+		if errors.As(err, &libvirtErr) &&
+			(libvirtErr.Code == libvirt.ERR_NO_SUPPORT || libvirtErr.Code == libvirt.ERR_INVALID_ARG) {
 			logger.Printf("libvirt does not support undefine flags: will try again without flags")
 			if err = domain.Undefine(); err != nil {
 				logger.Printf("couldn't undefine libvirt domain: %v", err)
@@ -741,6 +849,11 @@ func DeleteDomain(ctx context.Context, libvirtClient *libvirtClient, domainUUID 
 	return nil
 }
 
+// isCSIDataDisk identifies disks added by dataDisksToVirtio via their serial prefix.
+func isCSIDataDisk(disk libvirtxml.DomainDisk) bool {
+	return strings.HasPrefix(disk.Serial, csiDataDiskSerialPrefix)
+}
+
 func getDeletableDiskPaths(domainDef *libvirtxml.Domain) []string {
 	if domainDef == nil {
 		return nil
@@ -749,6 +862,9 @@ func getDeletableDiskPaths(domainDef *libvirtxml.Domain) []string {
 	paths := make([]string, 0, len(domainDef.Devices.Disks))
 	for _, disk := range domainDef.Devices.Disks {
 		if disk.Source == nil || disk.Source.File == nil || disk.Source.File.File == "" {
+			continue
+		}
+		if isCSIDataDisk(disk) {
 			continue
 		}
 		paths = append(paths, disk.Source.File.File)
@@ -764,11 +880,23 @@ func NewLibvirtClient(libvirtCfg Config) (*libvirtClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			_, _ = conn.Close()
+		}
+	}()
 
 	pool, err := conn.LookupStoragePoolByName(libvirtCfg.PoolName)
 	if err != nil {
 		return nil, fmt.Errorf("can't find storage pool %q: %v", libvirtCfg.PoolName, err)
 	}
+	defer func() {
+		if err != nil {
+			if freeErr := pool.Free(); freeErr != nil {
+				logger.Printf("failed to free pool handle during constructor cleanup: %v", freeErr)
+			}
+		}
+	}()
 
 	node, err := conn.GetNodeInfo()
 	if err != nil {
@@ -787,8 +915,6 @@ func NewLibvirtClient(libvirtCfg Config) (*libvirtClient, error) {
 		pool:        pool,
 		poolName:    libvirtCfg.PoolName,
 		networkName: libvirtCfg.NetworkName,
-		dataDir:     libvirtCfg.DataDir,
-		volName:     libvirtCfg.VolName,
 		nodeInfo:    node,
 		caps:        caps,
 	}, nil
@@ -804,24 +930,17 @@ func freeDomain(domain *libvirt.Domain, errCtx *error) {
 	}
 }
 
-// Attempts to determine launchSecurity Type from domain capabilities and hardware
-// Currently only supports S390PV
-func GetLaunchSecurityType(uri string) (LaunchSecurityType, error) {
-	conn, err := libvirt.NewConnect(uri)
-	if err != nil {
-		return NoLaunchSecurity, fmt.Errorf("unable to get libvirt connection [%v]", err)
+// GetLaunchSecurityType determines the launch security type from the node info
+// already retrieved by the libvirt client, avoiding an extra connection.
+// Currently only supports S390PV.
+func GetLaunchSecurityType(client *libvirtClient) (LaunchSecurityType, error) {
+	if client.nodeInfo == nil {
+		return NoLaunchSecurity, fmt.Errorf("node info is not available in libvirt client")
 	}
 
-	nodeInfo, err := conn.GetNodeInfo()
-	if err != nil {
-		return NoLaunchSecurity, fmt.Errorf("error retrieving node info: %v", err)
-	}
-
-	switch nodeInfo.Model {
+	switch client.nodeInfo.Model {
 	case archS390x:
 		return S390PV, nil
-	case "x86_64":
-		return NoLaunchSecurity, nil
 	default:
 		return NoLaunchSecurity, nil
 	}

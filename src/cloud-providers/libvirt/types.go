@@ -24,6 +24,8 @@ type Config struct {
 	CPU            uint
 	Memory         uint   // It stores the value in MiB
 	CPUSet         string // CPU set for pinning vCPUs (e.g., "0,2,4,6" or "0-3")
+	RootDiskSize   uint64 // Root disk size in GiB. Zero is treated as the default
+	// size for backwards compatibility.
 }
 
 type vmConfig struct {
@@ -37,6 +39,8 @@ type vmConfig struct {
 	launchSecurityType LaunchSecurityType
 	firmware           string
 	cpuset             string // CPU set for pinning vCPUs (e.g., "0,2,4,6" or "0-3")
+	volName            string
+	dataDisks          []string // Paths to CSI volume raw files to attach as data disks
 }
 
 type createDomainOutput struct {
@@ -53,10 +57,6 @@ type libvirtClient struct {
 
 	// libvirt network name
 	networkName string
-
-	dataDir string
-
-	volName string
 
 	// information about the target node
 	nodeInfo *libvirt.NodeInfo

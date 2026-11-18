@@ -39,9 +39,20 @@ type Config struct {
 	PodNamespace string           `json:"pod-namespace"`
 	PodName      string           `json:"pod-name"`
 
+	// CloudProvider is the cloud-api-adaptor provider name. The guest uses it
+	// to skip device-based detection when locating attached volumes.
+	CloudProvider string `json:"cloud-provider,omitempty"`
+
 	TLSServerKey  string `json:"tls-server-key,omitempty"`
 	TLSServerCert string `json:"tls-server-cert,omitempty"`
 	TLSClientCA   string `json:"tls-client-ca,omitempty"`
+
+	// MinTLSVersion and CipherSuites carry the operator-injected TLS profile through
+	// user-data to the agent protocol forwarder running inside the peer pod VM.
+	// These fields are serialized to apf.json and are immutable after VM boot —
+	// TLS profile changes only take effect for newly created peer pods.
+	MinTLSVersion string   `json:"tls-min-version,omitempty"`
+	CipherSuites  []string `json:"tls-cipher-suites,omitempty"`
 
 	PpPrivateKey []byte `json:"sc-pp-prv,omitempty"`
 	WnPublicKey  []byte `json:"sc-wn-pub,omitempty"`
@@ -74,6 +85,15 @@ func NewDaemon(spec *Config, listenAddr string, tlsConfig *tlsutil.TLSConfig, in
 
 	if tlsConfig != nil && !tlsConfig.HasCA() {
 		tlsConfig.CAData = []byte(spec.TLSClientCA)
+	}
+
+	if tlsConfig != nil {
+		if tlsConfig.MinTLSVersion == "" && spec.MinTLSVersion != "" {
+			tlsConfig.MinTLSVersion = spec.MinTLSVersion
+		}
+		if len(tlsConfig.CipherSuites) == 0 && len(spec.CipherSuites) > 0 {
+			tlsConfig.CipherSuites = spec.CipherSuites
+		}
 	}
 
 	daemon := &daemon{
@@ -116,7 +136,7 @@ func (d *daemon) Start(ctx context.Context) error {
 		// Create a TLS configuration object
 		tlsConfig, err := tlsutil.GetTLSConfigFor(d.tlsConfig)
 		if err != nil {
-			return fmt.Errorf("Failed to create tls config: %v", err)
+			return fmt.Errorf("failed to create tls config: %v", err)
 		}
 
 		listener, err = tls.Listen("tcp", d.listenAddr, tlsConfig)

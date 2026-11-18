@@ -14,7 +14,7 @@ on:
   # is that, unlike the `pull_request` event, the checked pull request isn't necessarily
   # rebased to main (so it is up to users ensure the pull request is rebased **before*
   # triggering this workflow).
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] TODO fix in #2214
     types:
       # This workflow will be run if the pull request is labeled test_e2e_libvirt,
       # so adding 'labeled' to the list of activity types.
@@ -34,15 +34,17 @@ permissions: {}
 
 jobs:
   authorize:
-    runs-on: ubuntu-24.04
+    name: authorize
+    runs-on: ubuntu-26.04
     if: |
      contains(github.event.pull_request.labels.*.name, 'test_e2e_aws') ||
+     contains(github.event.pull_request.labels.*.name, 'test_e2e_alibabacloud') ||
      contains(github.event.pull_request.labels.*.name, 'test_e2e_libvirt') ||
      contains(github.event.pull_request.labels.*.name, 'test_e2e_byom')
     steps:
       - run: "true"
   e2e:
-    uses: ./.github/workflows/e2e_run_all.yaml
+    uses: $/.github/workflows/e2e_run_all.yaml
     needs: [authorize]
     with:
       caa_image_tag: ci-pr${{ github.event.number }}
@@ -50,12 +52,17 @@ jobs:
       podvm_image_tag: ci-pr${{ github.event.number }}
       registry: ghcr.io/${{ github.repository_owner }}
     permissions:
-      id-token: write
-      contents: read
-      packages: write
-      attestations: write
-      artifact-metadata: write
+      id-token: write  # Required for OIDC authentication
+      contents: read  # Required to checkout code
+      packages: write  # Required to push container images
+      attestations: write  # Required to write attestations
+      artifact-metadata: write  # Required to write artifact metadata
     secrets:
       AWS_IAM_ROLE_ARN: ${{ secrets.AWS_IAM_ROLE_ARN }}
-      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+      ALIBABA_CLOUD_ROLE_ARN: ${{ secrets.ALIBABA_CLOUD_ROLE_ARN }}
+      ALIBABA_CLOUD_OIDC_PROVIDER_ARN: ${{ secrets.ALIBABA_CLOUD_OIDC_PROVIDER_ARN }}
       REGISTRY_CREDENTIAL_ENCODED: ${{ secrets.REGISTRY_CREDENTIAL_ENCODED }}
+      # Dummy values, since pull-request-target should not have access to upstream secrets
+      AZURE_CLIENT_ID: ''
+      AZURE_SUBSCRIPTION_ID: ''
+      AZURE_TENANT_ID: ''

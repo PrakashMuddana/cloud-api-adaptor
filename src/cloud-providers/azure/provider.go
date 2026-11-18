@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	armcompute "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v4"
 	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v2"
@@ -31,6 +32,8 @@ var logger = log.New(log.Writer(), "[adaptor/cloud/azure] ", log.LstdFlags|log.L
 var errNotReady = errors.New("address not ready")
 var errNotFound = errors.New("VM name not found")
 
+var diskResourceIDRe = regexp.MustCompile(`resourceGroups/([^/]+)/providers/Microsoft\.Compute/disks/(.+)$`)
+
 const (
 	maxInstanceNameLen = 63
 )
@@ -38,6 +41,7 @@ const (
 type azureProvider struct {
 	azureClient   azcore.TokenCredential
 	serviceConfig *Config
+	clientOptions *arm.ClientOptions // nil in production; tests set a fake transport
 }
 
 func NewProvider(config *Config) (provider.Provider, error) {
@@ -110,6 +114,29 @@ func generateSSHPublicKey() ([]byte, error) {
 	return publicKeyBytes, nil
 }
 
+// orderByPrimary returns the IP configurations of the given NICs with the
+// primary NIC's configurations first, followed by any secondary NICs'.
+// Azure does not guarantee the order in which
+// vm.Properties.NetworkProfile.NetworkInterfaces is returned, so callers
+// that depend on a stable "primary IP first" ordering (e.g. the worker node
+// connecting back to the Pod VM) must not rely on API response order alone.
+func orderByPrimary(nics []*armnetwork.Interface) []*armnetwork.InterfaceIPConfiguration {
+	var primary, secondary []*armnetwork.InterfaceIPConfiguration
+
+	for _, nic := range nics {
+		if nic.Properties == nil {
+			continue
+		}
+		if nic.Properties.Primary != nil && *nic.Properties.Primary {
+			primary = append(primary, nic.Properties.IPConfigurations...)
+		} else {
+			secondary = append(secondary, nic.Properties.IPConfigurations...)
+		}
+	}
+
+	return append(primary, secondary...)
+}
+
 func (p *azureProvider) getIPs(ctx context.Context, vm *armcompute.VirtualMachine) ([]netip.Addr, error) {
 	nicClient, err := armnetwork.NewInterfacesClient(p.serviceConfig.SubscriptionID, p.azureClient, nil)
 	if err != nil {
@@ -119,7 +146,7 @@ func (p *azureProvider) getIPs(ctx context.Context, vm *armcompute.VirtualMachin
 	nicRefs := vm.Properties.NetworkProfile.NetworkInterfaces
 
 	var ips []netip.Addr
-	var ipcs []*armnetwork.InterfaceIPConfiguration
+	var nics []*armnetwork.Interface
 
 	for _, nicRef := range nicRefs {
 		nicID := *nicRef.ID
@@ -129,8 +156,12 @@ func (p *azureProvider) getIPs(ctx context.Context, vm *armcompute.VirtualMachin
 		if err != nil {
 			return nil, fmt.Errorf("get network interface: %w", err)
 		}
-		ipcs = append(ipcs, nic.Properties.IPConfigurations...)
+		nics = append(nics, &nic.Interface)
 	}
+
+	// With a single NIC this is a no-op; with multiple NICs it guarantees
+	// the primary (control-plane) NIC's IPs come first.
+	ipcs := orderByPrimary(nics)
 
 	// we add the public ip addresses as first elements, if available
 	if p.serviceConfig.UsePublicIP {
@@ -178,7 +209,7 @@ func (p *azureProvider) getIPs(ctx context.Context, vm *armcompute.VirtualMachin
 }
 
 func (p *azureProvider) create(ctx context.Context, parameters *armcompute.VirtualMachine) (*armcompute.VirtualMachine, error) {
-	vmClient, err := armcompute.NewVirtualMachinesClient(p.serviceConfig.SubscriptionID, p.azureClient, nil)
+	vmClient, err := armcompute.NewVirtualMachinesClient(p.serviceConfig.SubscriptionID, p.azureClient, p.clientOptions)
 	if err != nil {
 		return nil, fmt.Errorf("creating VM client: %w", err)
 	}
@@ -192,7 +223,10 @@ func (p *azureProvider) create(ctx context.Context, parameters *armcompute.Virtu
 
 	resp, err := pollerResponse.PollUntilDone(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("waiting for the VM creation: %w", err)
+		// Azure accepted the request, so the VM may exist; return its ID so the caller can delete it
+		vmID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s",
+			p.serviceConfig.SubscriptionID, p.serviceConfig.ResourceGroupName, vmName)
+		return &armcompute.VirtualMachine{ID: to.Ptr(vmID), Name: to.Ptr(vmName)}, fmt.Errorf("waiting for the VM creation: %w", err)
 	}
 
 	logger.Printf("created VM successfully: %s", *resp.ID)
@@ -200,17 +234,21 @@ func (p *azureProvider) create(ctx context.Context, parameters *armcompute.Virtu
 	return &resp.VirtualMachine, nil
 }
 
-func (p *azureProvider) buildNetworkConfig(nicName string) *armcompute.VirtualMachineNetworkInterfaceConfiguration {
+// buildNetworkConfig builds a single NIC configuration for the given subnet.
+// isPrimary marks the NIC (and its IP configuration) as the VM's primary
+// NIC; withPublicIP attaches a public IP configuration to it.
+func (p *azureProvider) buildNetworkConfig(nicName, subnetID string, isPrimary, withPublicIP bool) *armcompute.VirtualMachineNetworkInterfaceConfiguration {
 	ipConfig := armcompute.VirtualMachineNetworkInterfaceIPConfiguration{
 		Name: to.Ptr("ip-config"),
 		Properties: &armcompute.VirtualMachineNetworkInterfaceIPConfigurationProperties{
 			Subnet: &armcompute.SubResource{
-				ID: to.Ptr(p.serviceConfig.SubnetID),
+				ID: to.Ptr(subnetID),
 			},
+			Primary: to.Ptr(isPrimary),
 		},
 	}
 
-	if p.serviceConfig.UsePublicIP {
+	if withPublicIP {
 		publicIPConfig := armcompute.VirtualMachinePublicIPAddressConfiguration{
 			Name: to.Ptr(nicName),
 			Properties: &armcompute.VirtualMachinePublicIPAddressConfigurationProperties{
@@ -223,6 +261,7 @@ func (p *azureProvider) buildNetworkConfig(nicName string) *armcompute.VirtualMa
 	config := armcompute.VirtualMachineNetworkInterfaceConfiguration{
 		Name: to.Ptr(nicName),
 		Properties: &armcompute.VirtualMachineNetworkInterfaceConfigurationProperties{
+			Primary:          to.Ptr(isPrimary),
 			DeleteOption:     to.Ptr(armcompute.DeleteOptionsDelete),
 			IPConfigurations: []*armcompute.VirtualMachineNetworkInterfaceIPConfiguration{&ipConfig},
 		},
@@ -235,6 +274,29 @@ func (p *azureProvider) buildNetworkConfig(nicName string) *armcompute.VirtualMa
 	}
 
 	return &config
+}
+
+// buildNetworkConfigs returns the NIC configurations to attach to the VM at
+// creation time. Azure requires all NICs to be declared upfront in the VM
+// create request (unlike AWS, which attaches the secondary ENI after the
+// instance is running), so both NICs are built here when multiNic is set.
+//
+// The primary NIC (on SubnetID) always gets the public IP when UsePublicIP
+// is set, multi-NIC or not: the worker node dials instance.IPs[0] (see
+// getIPs/orderByPrimary) to reach the Pod VM's forwarder, so that address
+// must stay on the primary NIC. The secondary NIC (on ExternalSubnetID),
+// when present, carries the Pod VM's own external traffic and never gets a
+// public IP from this flag.
+func (p *azureProvider) buildNetworkConfigs(instanceName string, multiNic bool) []*armcompute.VirtualMachineNetworkInterfaceConfiguration {
+	primary := p.buildNetworkConfig(fmt.Sprintf("%s-net", instanceName), p.serviceConfig.SubnetID, true, p.serviceConfig.UsePublicIP)
+
+	if !multiNic {
+		return []*armcompute.VirtualMachineNetworkInterfaceConfiguration{primary}
+	}
+
+	secondary := p.buildNetworkConfig(fmt.Sprintf("%s-ext", instanceName), p.serviceConfig.ExternalSubnetID, false, false)
+
+	return []*armcompute.VirtualMachineNetworkInterfaceConfiguration{primary, secondary}
 }
 
 func (p *azureProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (instance *provider.Instance, err error) {
@@ -252,7 +314,10 @@ func (p *azureProvider) CreateInstance(ctx context.Context, podName, sandboxID s
 	}
 
 	diskName := fmt.Sprintf("%s-disk", instanceName)
-	nicName := fmt.Sprintf("%s-net", instanceName)
+
+	if spec.MultiNic && p.serviceConfig.ExternalSubnetID == "" {
+		return nil, fmt.Errorf("multi-NIC pod networking was requested but AZURE_EXTERNAL_SUBNET_ID is not configured")
+	}
 
 	sshPublicKeyPath := os.ExpandEnv(p.serviceConfig.SSHKeyPath)
 	var sshBytes []byte
@@ -283,16 +348,28 @@ func (p *azureProvider) CreateInstance(ctx context.Context, podName, sandboxID s
 		imageID = spec.Image
 	}
 
-	vmParameters, err := p.getVMParameters(instanceSize, diskName, cloudConfigData, sshBytes, instanceName, nicName, imageID)
+	if len(spec.Volumes) > 0 {
+		if err := p.validateDiskCount(ctx, instanceSize, len(spec.Volumes)); err != nil {
+			return nil, err
+		}
+		if err := p.validateDisks(ctx, spec.Volumes); err != nil {
+			return nil, err
+		}
+	}
+
+	vmParameters, err := p.getVMParameters(instanceSize, diskName, cloudConfigData, sshBytes, instanceName, imageID, spec.Volumes, spec.MultiNic)
 	if err != nil {
 		return nil, err
 	}
 
-	logger.Printf("CreateInstance: name: %q", instanceName)
+	logger.Printf("CreateInstance: name: %q, multi-NIC: %v", instanceName, spec.MultiNic)
 
 	vm, err := p.create(ctx, vmParameters)
 	if err != nil {
-		return nil, fmt.Errorf("Creating instance (%v): %s", vm, err)
+		if vm != nil && vm.ID != nil {
+			return &provider.Instance{ID: *vm.ID, Name: instanceName}, fmt.Errorf("creating instance: %w", err)
+		}
+		return nil, fmt.Errorf("creating instance (%v): %s", vm, err)
 	}
 
 	vmID := *vm.ID
@@ -360,6 +437,11 @@ func (p *azureProvider) ConfigVerifier() error {
 			return fmt.Errorf("SSH key is invalid: %s", err)
 		}
 	}
+
+	if p.serviceConfig.ExternalSubnetID != "" && p.serviceConfig.ExternalSubnetID == p.serviceConfig.SubnetID {
+		return fmt.Errorf("AZURE_EXTERNAL_SUBNET_ID must differ from AZURE_SUBNET_ID")
+	}
+
 	return nil
 }
 
@@ -412,6 +494,108 @@ func (p *azureProvider) updateInstanceSizeSpecList() error {
 	return nil
 }
 
+// validateDiskCount checks that the requested number of data disks does not
+// exceed the maximum supported by the target VM size.
+func (p *azureProvider) validateDiskCount(ctx context.Context, instanceSize string, diskCount int) error {
+	vmSizesClient, err := armcompute.NewVirtualMachineSizesClient(p.serviceConfig.SubscriptionID, p.azureClient, nil)
+	if err != nil {
+		logger.Printf("WARNING: could not create VM sizes client for disk count validation: %v", err)
+		return nil
+	}
+
+	pager := vmSizesClient.NewListPager(p.serviceConfig.Region, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			logger.Printf("WARNING: could not list VM sizes for disk count validation: %v", err)
+			return nil
+		}
+		for _, vmSize := range page.Value {
+			if vmSize.Name != nil && *vmSize.Name == instanceSize && vmSize.MaxDataDiskCount != nil {
+				maxDisks := int(*vmSize.MaxDataDiskCount)
+				if diskCount > maxDisks {
+					return fmt.Errorf("requested %d data disks but VM size %s supports at most %d",
+						diskCount, instanceSize, maxDisks)
+				}
+				logger.Printf("Disk count validation: %d/%d data disks for VM size %s", diskCount, maxDisks, instanceSize)
+				return nil
+			}
+		}
+	}
+
+	logger.Printf("WARNING: could not find max disk count for VM size %s, skipping validation", instanceSize)
+	return nil
+}
+
+// validateDisks checks that all CSI volumes exist, are not already attached,
+// and are in the same region as the target VM.
+func (p *azureProvider) validateDisks(ctx context.Context, volumes []provider.CloudVolume) error {
+	disksClient, err := armcompute.NewDisksClient(p.serviceConfig.SubscriptionID, p.azureClient, nil)
+	if err != nil {
+		return fmt.Errorf("creating disks client for zone validation: %w", err)
+	}
+
+	var errs []string
+	for _, vol := range volumes {
+		rg, diskName, parseErr := parseDiskResourceID(vol.DiskID)
+		if parseErr != nil {
+			logger.Printf("WARNING: could not parse resource group/disk name from disk ID %q, skipping validation", vol.DiskID)
+			continue
+		}
+
+		disk, err := disksClient.Get(ctx, rg, diskName, nil)
+		if err != nil {
+			if strings.Contains(err.Error(), "ResourceNotFound") || strings.Contains(err.Error(), "NotFound") {
+				errs = append(errs, fmt.Sprintf("disk %q does not exist in resource group %q", diskName, rg))
+			} else {
+				errs = append(errs, fmt.Sprintf("disk %q is inaccessible: %v", vol.DiskID, err))
+			}
+			continue
+		}
+
+		if disk.Properties != nil && disk.Properties.DiskState != nil {
+			state := *disk.Properties.DiskState
+			if state == armcompute.DiskStateAttached || state == armcompute.DiskStateReserved {
+				managedBy := ""
+				if disk.ManagedBy != nil {
+					managedBy = *disk.ManagedBy
+				}
+				errs = append(errs, fmt.Sprintf("disk %q is in state %q (attached to %s) — cannot attach to new PodVM",
+					vol.DiskID, state, managedBy))
+				continue
+			}
+		}
+
+		diskLocation := strings.ToLower(strings.ReplaceAll(*disk.Location, " ", ""))
+		vmLocation := strings.ToLower(strings.ReplaceAll(p.serviceConfig.Region, " ", ""))
+
+		if diskLocation != vmLocation {
+			errs = append(errs, fmt.Sprintf("disk %q is in region %q but PodVM targets region %q",
+				vol.DiskID, *disk.Location, p.serviceConfig.Region))
+			continue
+		}
+
+		if len(disk.Zones) > 0 {
+			logger.Printf("Disk %q is in zone(s) %v — ensure PodVM targets a compatible zone", vol.DiskID, disk.Zones)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("disk pre-validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// parseDiskResourceID extracts resource group and disk name from an Azure
+// resource ID like /subscriptions/.../resourceGroups/RG/providers/Microsoft.Compute/disks/NAME.
+func parseDiskResourceID(diskID string) (resourceGroup, diskName string, err error) {
+	match := diskResourceIDRe.FindStringSubmatch(diskID)
+	if len(match) < 3 {
+		return "", "", fmt.Errorf("cannot parse Azure disk resource ID: %q", diskID)
+	}
+	return match[1], match[2], nil
+}
+
 func (p *azureProvider) getResourceTags() map[string]*string {
 	tags := map[string]*string{}
 
@@ -422,7 +606,7 @@ func (p *azureProvider) getResourceTags() map[string]*string {
 	return tags
 }
 
-func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig string, sshBytes []byte, instanceName, nicName string, imageID string) (*armcompute.VirtualMachine, error) {
+func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig string, sshBytes []byte, instanceName, imageID string, csiVolumes []provider.CloudVolume, multiNic bool) (*armcompute.VirtualMachine, error) {
 	userDataB64 := base64.StdEncoding.EncodeToString([]byte(cloudConfig))
 
 	// Azure limits the base64 encrypted userData to 64KB.
@@ -431,29 +615,26 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 	if len(userDataB64) > 64*1024 {
 		return nil, fmt.Errorf("base64 encoded userData is greater than 64KB")
 	}
-	var managedDiskParams *armcompute.ManagedDiskParameters
 	var securityProfile *armcompute.SecurityProfile
+
+	securityType := armcompute.SecurityTypesTrustedLaunch
+	managedDiskParams := &armcompute.ManagedDiskParameters{
+		StorageAccountType: to.Ptr(armcompute.StorageAccountTypesPremiumLRS),
+	}
+
 	if !p.serviceConfig.DisableCVM {
-		managedDiskParams = &armcompute.ManagedDiskParameters{
-			StorageAccountType: to.Ptr(armcompute.StorageAccountTypesPremiumLRS),
-			SecurityProfile: &armcompute.VMDiskSecurityProfile{
-				SecurityEncryptionType: to.Ptr(armcompute.SecurityEncryptionTypesVMGuestStateOnly),
-			},
+		securityType = armcompute.SecurityTypesConfidentialVM
+		managedDiskParams.SecurityProfile = &armcompute.VMDiskSecurityProfile{
+			SecurityEncryptionType: to.Ptr(armcompute.SecurityEncryptionTypesVMGuestStateOnly),
 		}
+	}
 
-		securityProfile = &armcompute.SecurityProfile{
-			SecurityType: to.Ptr(armcompute.SecurityTypesConfidentialVM),
-			UefiSettings: &armcompute.UefiSettings{
-				SecureBootEnabled: to.Ptr(p.serviceConfig.EnableSecureBoot),
-				VTpmEnabled:       to.Ptr(true),
-			},
-		}
-	} else {
-		managedDiskParams = &armcompute.ManagedDiskParameters{
-			StorageAccountType: to.Ptr(armcompute.StorageAccountTypesPremiumLRS),
-		}
-
-		securityProfile = nil
+	securityProfile = &armcompute.SecurityProfile{
+		SecurityType: to.Ptr(securityType),
+		UefiSettings: &armcompute.UefiSettings{
+			SecureBootEnabled: to.Ptr(p.serviceConfig.EnableSecureBoot),
+			VTpmEnabled:       to.Ptr(true),
+		},
 	}
 
 	imgRef := &armcompute.ImageReference{
@@ -465,7 +646,7 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 		}
 	}
 
-	networkConfig := p.buildNetworkConfig(nicName)
+	networkConfigs := p.buildNetworkConfigs(instanceName, multiNic)
 
 	// Configure OS disk with optional root volume size
 	osDisk := &armcompute.OSDisk{
@@ -482,6 +663,20 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 		logger.Printf("Setting root volume size to %d GB", p.serviceConfig.RootVolumeSize)
 	}
 
+	// Attach CSI volumes as data disks
+	var dataDisks []*armcompute.DataDisk
+	for i, vol := range csiVolumes {
+		logger.Printf("Attaching data disk: LUN %d, ID: %s", i, vol.DiskID)
+		dataDisks = append(dataDisks, &armcompute.DataDisk{
+			Lun:          to.Ptr(int32(i)), //nolint:gosec // bounded above
+			CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesAttach),
+			DeleteOption: to.Ptr(armcompute.DiskDeleteOptionTypesDetach),
+			ManagedDisk: &armcompute.ManagedDiskParameters{
+				ID: to.Ptr(vol.DiskID),
+			},
+		})
+	}
+
 	vmParameters := armcompute.VirtualMachine{
 		Location: to.Ptr(p.serviceConfig.Region),
 		Properties: &armcompute.VirtualMachineProperties{
@@ -491,6 +686,7 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 			StorageProfile: &armcompute.StorageProfile{
 				ImageReference: imgRef,
 				OSDisk:         osDisk,
+				DataDisks:      dataDisks,
 			},
 			OSProfile: &armcompute.OSProfile{
 				AdminUsername: to.Ptr(p.serviceConfig.SSHUserName),
@@ -508,7 +704,7 @@ func (p *azureProvider) getVMParameters(instanceSize, diskName, cloudConfig stri
 			},
 			NetworkProfile: &armcompute.NetworkProfile{
 				NetworkAPIVersion:              to.Ptr(armcompute.NetworkAPIVersionTwoThousandTwenty1101),
-				NetworkInterfaceConfigurations: []*armcompute.VirtualMachineNetworkInterfaceConfiguration{networkConfig},
+				NetworkInterfaceConfigurations: networkConfigs,
 			},
 			SecurityProfile: securityProfile,
 			DiagnosticsProfile: &armcompute.DiagnosticsProfile{

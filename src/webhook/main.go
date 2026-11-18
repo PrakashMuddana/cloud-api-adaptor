@@ -20,6 +20,7 @@ import (
 	"flag"
 	"os"
 
+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util/tlsconfig"
 	mutating "github.com/confidential-containers/cloud-api-adaptor/src/webhook/pkg/mutating"
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -31,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -52,7 +54,7 @@ func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -65,14 +67,26 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	// Build TLS options from operator-injected env vars.
+	// The operator is the single source of truth for the cluster TLS profile.
+	webhookTLSOpts, err := tlsconfig.OptionsFromEnv()
+	if err != nil {
+		setupLog.Error(err, "invalid TLS configuration")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
-			BindAddress: metricsAddr,
+			BindAddress:    metricsAddr,
+			SecureServing:  true,
+			FilterProvider: filters.WithAuthenticationAndAuthorization,
+			TLSOpts:        webhookTLSOpts,
 		},
 		WebhookServer: &webhook.DefaultServer{
 			Options: webhook.Options{
-				Port: 9443,
+				Port:    9443,
+				TLSOpts: webhookTLSOpts,
 			},
 		},
 		HealthProbeBindAddress: probeAddr,

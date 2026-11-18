@@ -36,6 +36,9 @@ type PeerPodStatus struct {
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:printcolumn:name="Cloud Provider",type="string",JSONPath=".spec.cloudProvider"
+//+kubebuilder:printcolumn:name="Instance ID",type="string",JSONPath=".spec.instanceID"
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // PeerPod is the Schema for the peerpods API
 type PeerPod struct {
@@ -53,8 +56,4 @@ type PeerPodList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []PeerPod `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&PeerPod{}, &PeerPodList{})
 }

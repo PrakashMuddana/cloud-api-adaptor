@@ -3,16 +3,12 @@ namePrefix: peerpodctrl-
 
 # PeerPod controller image
 image:
-  repository: quay.io/confidential-containers/peerpod-ctrl
+  repository: ghcr.io/confidential-containers/peerpod-ctrl
   tag: latest
   pullPolicy: IfNotPresent
 
-# kube-rbac-proxy: Sidecar container that protects the /metrics endpoint with RBAC authentication
-# When enabled, only authenticated clients with proper RBAC permissions can access metrics
-# Set to false to expose metrics without authentication (not recommended for production)
-authProxy:
-  enabled: true
-  image: registry.k8s.io/kubebuilder/kube-rbac-proxy:v0.14.0
+# Metrics are served by the manager over TLS on port 8443. Scrapers must present
+# a ServiceAccount token bound to the metrics-reader ClusterRole.
 
 # Additional labels merged into the peerpod-ctrl controller-manager pod template.
 # For example, opt into webhook injection via
@@ -27,3 +23,12 @@ podLabels: {}
 # to the cloud provider.
 serviceAccount:
   annotations: {}
+
+# Minimum TLS version for the metrics server. Accepts "VersionTLS12" or "VersionTLS13".
+# Defaults to Go's TLS default (TLS 1.2) when empty. Set from the cluster TLS
+# profile, the same way the webhook chart's tlsMinVersion is.
+tlsMinVersion: ""
+
+# Comma-separated list of IANA TLS cipher suite names for the metrics server.
+# Not applicable when tlsMinVersion is VersionTLS13.
+tlsCipherSuites: ""
